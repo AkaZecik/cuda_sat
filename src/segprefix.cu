@@ -9,6 +9,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
+#define WARPS_NB 10
+
 typedef unsigned int uint;
 typedef unsigned char uchar;
 
@@ -19,6 +21,9 @@ struct clause {
 	uchar s1:1;
 	uchar s2:1;
 	uchar s3:1;
+	uchar v1:1;
+	uchar v2:1;
+	uchar v3:1;
 };
 
 // lX - literal X
@@ -56,21 +61,20 @@ struct clause {
 
 /* Triples the number of formulas in a batch and marks invalid/missing ones
  * 
- * d_arr - array of formulas and their (partial) assignments and a free space
- *         for newly generated formulas
- * d_valid - array that holds flags indicating whether a formula is valid or not
+ * d_f - array of formulas and a free space for new formulas
+ * d_a - array of variable assignments
+ * d_v - array of flags indicating whether a formula is valid or not
  * s - predefined size of a batch of formulas
  * k - actual number of formulas to triple
  * n - total number of literals
  * r - total number of clauses
  */
-__global__ void sat_kernel(uint *d_arr, uint *d_valid, int s, int k, int n, int r) {
-	int warps_nb = (blockDim.x + 31) >> 5;
-	int warp_id = warps_nb * blockIdx.x + (threadIdx.x >> 5);
+__global__ void sat_kernel(clause *d_f, uint *d_a, uint *d_v, int k, int n, int r) {
+	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
-	uint *formula = d_arr + formula_id * (n + r);
-	uint *assignments = formula + r;
+	uint *formula = d_f + formula_id * r;
+	uint *assignments = d_a + formula_id * r;
 	uint first_clause = formula[0];
 	int lit1 = l1(first_clause);
 	int lit2 = l2(first_clause);
