@@ -1,5 +1,4 @@
 #include <cstdio>
-#include "segprefix.h"
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -18,75 +17,50 @@ struct clause {
 	uchar l1;
 	uchar l2;
 	uchar l3;
-	uchar s1:1;
-	uchar s2:1;
-	uchar s3:1;
-	uchar v1:1;
-	uchar v2:1;
-	uchar v3:1;
+	bool s1:1;
+	bool s2:1;
+	bool s3:1;
+	bool v1:1;
+	bool v2:1;
+	bool v3:1;
 };
-
-// lX - literal X
-// vX - value of literal X
-// sX - sign of literal X
-#define l1(n) (((n) & 0xff000000u) >> 24)
-#define l2(n) (((n) & 0x00ff0000u) >> 16)
-#define l3(n) (((n) & 0x0000ff00u) >> 8)
-#define v1(n) (((n) & 0x00000080u) >> 7)
-#define v2(n) (((n) & 0x00000040u) >> 6)
-#define v3(n) (((n) & 0x00000020u) >> 5)
-#define s1(n) (((n) & 0x00000010u) >> 4)
-#define s2(n) (((n) & 0x00000008u) >> 3)
-#define s3(n) (((n) & 0x00000004u) >> 2)
-
-#define unset_l1(n) ((n) & 0x00ffffffu)
-#define unset_l2(n) ((n) & 0xff00ffffu)
-#define unset_l3(n) ((n) & 0xffff00ffu)
-#define unset_v1(n) ((n) & 0xffffff7fu)
-#define unset_v2(n) ((n) & 0xffffffbfu)
-#define unset_v3(n) ((n) & 0xffffffdfu)
-#define unset_s1(n) ((n) & 0xffffffefu)
-#define unset_s2(n) ((n) & 0xfffffff7u)
-#define unset_s3(n) ((n) & 0xfffffffbu)
-
-#define set_l1(n, v) (unset_l1(n) | (((v) & 0x000000ffu) << 24))
-#define set_l2(n, v) (unset_l2(n) | (((v) & 0x000000ffu) << 16))
-#define set_l3(n, v) (unset_l3(n) | (((v) & 0x000000ffu) << 8))
-#define set_v1(n) ((n) | 0x00000080u)
-#define set_v2(n) ((n) | 0x00000040u)
-#define set_v3(n) ((n) | 0x00000020u)
-#define set_s1(n) ((n) | 0x00000010u)
-#define set_s2(n) ((n) | 0x00000008u)
-#define set_s3(n) ((n) | 0x00000004u)
 
 /* Triples the number of formulas in a batch and marks invalid/missing ones
  * 
- * d_f - array of formulas and a free space for new formulas
- * d_a - array of variable assignments
+ * d_f - array of formulas and a triple of a free space for new formulas
  * d_v - array of flags indicating whether a formula is valid or not
- * s - predefined size of a batch of formulas
- * k - actual number of formulas to triple
+ * k - number of formulas to triple
  * n - total number of literals
  * r - total number of clauses
  */
-__global__ void sat_kernel(clause *d_f, uint *d_a, uint *d_v, int k, int n, int r) {
+__global__ void sat_kernel(clause *d_f, uint *d_v, int k, int n, int r) {
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
 	uint *formula = d_f + formula_id * r;
-	uint *assignments = d_a + formula_id * r;
-	uint first_clause = formula[0];
-	int lit1 = l1(first_clause);
-	int lit2 = l2(first_clause);
-	int lit3 = l3(first_clause);
+	clause fc = formula[0]; // first clause
 
 	if(branch_id == 0) {
-		if(lit1 == 0) {
+		if(fc.s1) {
 			return;
 		}
 
 		for(int i = threadIdx.x & 31; i < r; i += 32) {
-			uint clause = formula[i];
+			clause c = formula[i];
+
+			if(!c.s1) {
+				if(c.l1 == fc.l1) {
+					c.v1 = fc.v1;
+				}
+
+				if(c.l1 == fc.l2) {
+					c.v1 = fc.v2;
+				}
+
+				if(c.l1 == fc.l3) {
+					c.v1 = fc.v3;
+				}
+			}
 		}
 	}
 
