@@ -9,6 +9,18 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
+typedef unsigned int uint;
+typedef unsigned char uchar;
+
+struct clause {
+	uchar l1;
+	uchar l2;
+	uchar l3;
+	uchar s1:1;
+	uchar s2:1;
+	uchar s3:1;
+};
+
 // lX - literal X
 // vX - value of literal X
 // sX - sign of literal X
@@ -42,14 +54,21 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 #define set_s2(n) ((n) | 0x00000008u)
 #define set_s3(n) ((n) | 0x00000004u)
 
-typedef unsigned int uint;
-typedef unsigned char uchar;
-
+/* Triples the number of formulas in a batch and marks invalid/missing ones
+ * 
+ * d_arr - array of formulas and their (partial) assignments and a free space
+ *         for newly generated formulas
+ * d_valid - array that holds flags indicating whether a formula is valid or not
+ * s - predefined size of a batch of formulas
+ * k - actual number of formulas to triple
+ * n - total number of literals
+ * r - total number of clauses
+ */
 __global__ void sat_kernel(uint *d_arr, uint *d_valid, int s, int k, int n, int r) {
 	int warps_nb = (blockDim.x + 31) >> 5;
 	int warp_id = warps_nb * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
-	int copy_id = warp_id - 3 * formula_id;
+	int branch_id = warp_id - 3 * formula_id;
 	uint *formula = d_arr + formula_id * (n + r);
 	uint *assignments = formula + r;
 	uint first_clause = formula[0];
@@ -57,8 +76,8 @@ __global__ void sat_kernel(uint *d_arr, uint *d_valid, int s, int k, int n, int 
 	int lit2 = l2(first_clause);
 	int lit3 = l3(first_clause);
 
-	if(copy_id == 0) {
-		if(a == 0) {
+	if(branch_id == 0) {
+		if(lit1 == 0) {
 			return;
 		}
 
@@ -67,7 +86,7 @@ __global__ void sat_kernel(uint *d_arr, uint *d_valid, int s, int k, int n, int 
 		}
 	}
 
-	if(copy_id == 1) {
+	if(branch_id == 1) {
 		if(b == 0) {
 			return;
 		}
@@ -77,7 +96,7 @@ __global__ void sat_kernel(uint *d_arr, uint *d_valid, int s, int k, int n, int 
 		}
 	}
 
-	if(copy_id == 2) {
+	if(branch_id == 2) {
 		if(c == 0) {
 			return;
 		}
