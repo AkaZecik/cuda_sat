@@ -10,7 +10,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 #define WARPS_NB 10
-#define abs(n) ((n) & 0x7fu)
+#define abs8(n) ((n) & 0x7fu)
+#define abs32(n) ((n) & 0x7fffffffu)
 
 struct clause {
 	/* Field 'flags':
@@ -20,7 +21,7 @@ struct clause {
 	 *   0x08u - literal l[0] was assigned
 	 *   0x10u - literal l[1] was assigned
 	 *   0x20u - literal l[2] was assigned
-	 * Nullified if: !((c.flags & 0x2au) && (c.flags & 0x15u))
+	 * Nullified if: !((c.flags & 0x38u) && (c.flags & 0x07u))
 	 * Invalid if: (c.flags & 0x3fu) == 0x2au
 	 */
 	int8_t l[3];
@@ -36,14 +37,14 @@ struct clause {
  * k - number of formulas to triple
  * r - total number of clauses
  */
-__global__ void sat_kernel(clause *const d_f, int *const d_v, int k, int r) {
+__global__ void sat_kernel(clause *d_f, unsigned int *d_v, int k, int r) {
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
-	int *valid = d_v + k * branch_id + formula_id;
+	unsigned int *valid = d_v + k * branch_id + formula_id;
 	clause *formula = d_f + formula_id * r;
-	clause *destination = d_f + (3 * k * branch_id + formula_id) * r;
-	clause fc = formula[0];
+	clause *destination = d_f + ((3 + branch_id) * k + formula_id) * r;
+	clause fc = formula[0]; // this might be slow
 
 	if(!(fc.flags & (0x08u << branch_id))) {
 		*valid = 0;
@@ -55,7 +56,7 @@ __global__ void sat_kernel(clause *const d_f, int *const d_v, int k, int r) {
 
 		for(int l = 0; l < 3; ++l) {
 			for(int y = 0; y < branch_id; ++y) {
-				if(!(cl.flags & (0x08u << l)) && abs(cl.l[l]) == abs(fc.l[y])) {
+				if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[y])) {
 					cl.flags |= (0x08u + (fc.l[y] < 0)) << l;
 				}
 			}
@@ -75,27 +76,28 @@ __global__ void sat_kernel(clause *const d_f, int *const d_v, int k, int r) {
 
 /*************************** 1D_SCAN *****************************/
 
-__device__ volatile int id = 0;
-__device__ volatile int d_p[32];
+__device__ volatile unsigned int id = 0;
+__device__ volatile unsigned int d_p[32];
+__device__ volatile unsigned int last;
 
-__inline__ __device__ int warp_scan(int v) {
+__inline__ __device__ unsigned int warp_scan(unsigned int v) {
 	int lane_id = threadIdx.x & 31;
 
 	for(int i = 1; i < 32; i <<= 1) {
 		int _v = __shfl_up_sync(0xffffffffu, v, i);
 
 		if(lane_id >= i) {
-			v += _v;
+			v += abs32(_v);
 		}
 	}
 
 	return v;
 }
 
-__global__ void 1d_scan(int *d_v, int k, int range_parts) {
+__global__ void 1d_scan(unsigned int *d_v, int k, int range_parts, int range) {
 	__shared__ partials[33];
 	__shared__ prev;
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	int tid = blockIdx.x * range + threadIdx.x;
 	int warp_id = threadIdx.x >> 5;
 	int lane_id = threadIdx.x & 31;
 
@@ -107,7 +109,7 @@ __global__ void 1d_scan(int *d_v, int k, int range_parts) {
 	__syncthreads();
 
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		int v = warp_scan(d_v[tid]);
+		unsigned int v = warp_scan(d_v[tid]);
 
 		if(lane_id == 31) {
 			values[warp_id + 1] = v;
@@ -121,17 +123,17 @@ __global__ void 1d_scan(int *d_v, int k, int range_parts) {
 
 		__syncthreads();
 
-		d_v[tid] = p + prev;
+		d_v[tid] = v + abs32(prev);
 
 		__syncthreads();
 
 		if((tid & 1023) == 1023) {
-			prev = p;
+			prev = v;
 		}
 	}
 
 	if((tid & 1023) == 1023) {
-		d_p[blockIdx.x] = p;
+		d_p[blockIdx.x] = prev;
 		__threadfence();
 
 		if(atomicAdd(&id, 1) == gridDim.x - 1) {
@@ -141,29 +143,111 @@ __global__ void 1d_scan(int *d_v, int k, int range_parts) {
 	}
 }
 
-__global__ void 1d_propagate(int *d_v, int k, int range_parts) {
+__global__ void 1d_propagate(unsigned int *d_v, int k, int range_parts, int range) {
+	__shared__ int prev;
+	int tid = (blockIdx.x + 1) * range + threadIdx.x;
 	
+	if(threadIdx.x = 0) {
+		prev = d_p[blockIdx.x];
+	}
+
+	__syncthreads();
+
+	unsigned int v;
+
+	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+		v = d_v[tid] += prev;
+	}
+
+	if(tid == k + 1023) {
+		last = v;
+	}
 }
 
 /************************** 1D_DEFRAG ****************************/
 
 __global__ void 1d_defrag(clause *d_f, int *d_v, int k, int r) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
-	int formula_size = r * sizeof(clause);
-	int shift = 3 * k * formula_size;
-	int new_position = d_v[warp_id] * formula_size; // might not work
+	unsigned int v = d_v[warp_id];
+	unsigned int valid = v & 0x80000000u;
+	clause *formula = d_f + (3 * k + warp_id) * r;
+	clause *destination = d_f + (valid ? position - 1 : last + warp_id - position) * r;
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
-		if(flag is 1) { // fix it
-			d_f[new_position + i] = d_f[shift + warp_id + i];
-		}
+		destination[i] = formula[i];
 	}
 }
 
 /*************************** 2D_SCAN *****************************/
 
-__global__ void 2d_scan(clause *d_f, int *d_v, int k, int r) {
+__inline__ __device__ unsigned int warp_scan(unsigned int v, bool first) {
+	int lane_id = threadIdx.x & 31;
 
+	for(int i = 1; i < 32; i <<= 1) {
+		int _v = __shfl_up_sync(0xffffffffu, v, i);
+
+		if(lane_id >= i && !first) {
+			v += abs32(_v);
+		}
+	}
+
+	return v;
+}
+
+__global__ void 2d_scan(int *d_f, int *d_v, int k, int r, int range_parts, int range) {
+	/////////////////// NOT DONE YET! ///////////////////////
+	__shared__ partials[33];
+	__shared__ prev;
+	int tid = blockIdx.x * range + threadIdx.x;
+	int warp_id = threadIdx.x >> 5;
+	int lane_id = threadIdx.x & 31;
+
+	if(tid == 0) {
+		values[0] = 0;
+		prev = 0;
+	}
+
+	__syncthreads();
+
+	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+		clause cl = d_v[tid];
+		unsigned int satisfied = (cl.flags & 0x07u) ? 0 : 0x80000001u;
+		bool first = tid % r == 0;
+		unsigned int v = warp_scan(satisfied, first);
+
+		if(lane_id == 31) {
+			values[warp_id + 1] = v;
+		}
+
+		__syncthreads();
+
+		if(warp_id == 0) {
+			partials[lane_id] = warp_scan(partials[lane_id]);
+		}
+
+		__syncthreads();
+
+		if(tid % range < r) { // check ---> jest zle
+			d_v[tid] = v + abs32(prev);
+		}
+
+		__syncthreads();
+
+		if((tid & 1023) == 1023) {
+			prev = v;
+		}
+	}
+
+	if((tid & 1023) == 1023) {
+		d_p[blockIdx.x] = prev;
+		__threadfence();
+
+		if(atomicAdd(&id, 1) == gridDim.x - 1) {
+			id = 0;
+			d_p[lane_id] = warp_scan(d_p[lane_id]);
+		}
+	}
+	/////////////////// NOT DONE YET! ///////////////////////
 }
 
 /************************** 2D_DEFRAG ****************************/
