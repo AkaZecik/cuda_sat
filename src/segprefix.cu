@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <stdint.h>
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -9,89 +10,182 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 #define WARPS_NB 10
-
-typedef unsigned int uint;
-typedef unsigned char uchar;
+#define abs(n) ((n) & 0x7fu)
 
 struct clause {
-	uchar l1;
-	uchar l2;
-	uchar l3;
-	bool s1:1;
-	bool s2:1;
-	bool s3:1;
-	bool v1:1;
-	bool v2:1;
-	bool v3:1;
+	/* Field 'flags':
+	 *   0x01u - value of literal l[0]
+	 *   0x02u - value of literal l[1]
+	 *   0x04u - value of literal l[2]
+	 *   0x08u - literal l[0] was assigned
+	 *   0x10u - literal l[1] was assigned
+	 *   0x20u - literal l[2] was assigned
+	 * Nullified if: !((c.flags & 0x2au) && (c.flags & 0x15u))
+	 * Invalid if: (c.flags & 0x3fu) == 0x2au
+	 */
+	int8_t l[3];
+	uint8_t flags;
 };
+
+/************************* SAT_KERNEL ****************************/
 
 /* Triples the number of formulas in a batch and marks invalid/missing ones
  * 
- * d_f - array of formulas and a triple of a free space for new formulas
+ * d_f - array of formulas and a free space for new formulas
  * d_v - array of flags indicating whether a formula is valid or not
  * k - number of formulas to triple
- * n - total number of literals
  * r - total number of clauses
  */
-__global__ void sat_kernel(clause *d_f, uint *d_v, int k, int n, int r) {
+__global__ void sat_kernel(clause *const d_f, int *const d_v, int k, int r) {
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
-	uint *formula = d_f + formula_id * r;
-	clause fc = formula[0]; // first clause
+	int *valid = d_v + k * branch_id + formula_id;
+	clause *formula = d_f + formula_id * r;
+	clause *destination = d_f + (3 * k * branch_id + formula_id) * r;
+	clause fc = formula[0];
 
-	if(branch_id == 0) {
-		if(fc.s1) {
-			return;
-		}
+	if(!(fc.flags & (0x08u << branch_id))) {
+		*valid = 0;
+		return;
+	}
 
-		for(int i = threadIdx.x & 31; i < r; i += 32) {
-			clause c = formula[i];
+	for(int i = threadIdx.x & 31; i < r; i += 32) {
+		clause cl = formula[i];
 
-			if(!c.s1) {
-				if(c.l1 == fc.l1) {
-					c.v1 = fc.v1;
-				}
-
-				if(c.l1 == fc.l2) {
-					c.v1 = fc.v2;
-				}
-
-				if(c.l1 == fc.l3) {
-					c.v1 = fc.v3;
+		for(int l = 0; l < 3; ++l) {
+			for(int y = 0; y < branch_id; ++y) {
+				if(!(cl.flags & (0x08u << l)) && abs(cl.l[l]) == abs(fc.l[y])) {
+					cl.flags |= (0x08u + (fc.l[y] < 0)) << l;
 				}
 			}
+
+			if(cl.l[l] == fc.l[branch_id]) {
+				cl.flags |= (0x08u + (fc.l[branch_id] > 0)) << l;
+			}
+		}
+
+		if((cl.flags & 0x3fu) == 0x2au) {
+			*valid = 0;
+		}
+
+		destination[i] = cl;
+	}
+}
+
+/*************************** 1D_SCAN *****************************/
+
+__device__ volatile int id = 0;
+__device__ volatile int d_p[32];
+
+__inline__ __device__ int warp_scan(int v) {
+	int lane_id = threadIdx.x & 31;
+
+	for(int i = 1; i < 32; i <<= 1) {
+		int _v = __shfl_up_sync(0xffffffffu, v, i);
+
+		if(lane_id >= i) {
+			v += _v;
 		}
 	}
 
-	if(branch_id == 1) {
-		if(b == 0) {
-			return;
+	return v;
+}
+
+__global__ void 1d_scan(int *d_v, int k, int range_parts) {
+	__shared__ partials[33];
+	__shared__ prev;
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	int warp_id = threadIdx.x >> 5;
+	int lane_id = threadIdx.x & 31;
+
+	if(tid == 0) {
+		values[0] = 0;
+		prev = 0;
+	}
+
+	__syncthreads();
+
+	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+		int v = warp_scan(d_v[tid]);
+
+		if(lane_id == 31) {
+			values[warp_id + 1] = v;
 		}
 
-		for(int i = threadIdx.x & 31; i < r; i += 32) {
-			uint clause = formula[i];
+		__syncthreads();
+
+		if(warp_id == 0) {
+			partials[lane_id] = warp_scan(partials[lane_id]);
+		}
+
+		__syncthreads();
+
+		d_v[tid] = p + prev;
+
+		__syncthreads();
+
+		if((tid & 1023) == 1023) {
+			prev = p;
 		}
 	}
 
-	if(branch_id == 2) {
-		if(c == 0) {
-			return;
-		}
+	if((tid & 1023) == 1023) {
+		d_p[blockIdx.x] = p;
+		__threadfence();
 
-		for(int i = threadIdx.x & 31; i < r; i += 32) {
-			uint clause = formula[i];
+		if(atomicAdd(&id, 1) == gridDim.x - 1) {
+			id = 0;
+			d_p[lane_id] = warp_scan(d_p[lane_id]);
 		}
 	}
 }
 
-__global__ void 1d_scan() {
+__global__ void 1d_propagate(int *d_v, int k, int range_parts) {
+	
+}
+
+/************************** 1D_DEFRAG ****************************/
+
+__global__ void 1d_defrag(clause *d_f, int *d_v, int k, int r) {
+	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
+	int formula_size = r * sizeof(clause);
+	int shift = 3 * k * formula_size;
+	int new_position = d_v[warp_id] * formula_size; // might not work
+
+	for(int i = threadIdx.x & 31; i < r; i += 32) {
+		if(flag is 1) { // fix it
+			d_f[new_position + i] = d_f[shift + warp_id + i];
+		}
+	}
+}
+
+/*************************** 2D_SCAN *****************************/
+
+__global__ void 2d_scan(clause *d_f, int *d_v, int k, int r) {
 
 }
 
-__global__ void 2d_scan() {
+/************************** 2D_DEFRAG ****************************/
+
+__global__ void 2d_defrag(clause *d_f, int *d_v, ) {
 
 }
+
+/**************************** SWAP *******************************/
+
+void pipeline() {
+	while(true) {
+		1d_scan<<<0, 0>>>();
+		1d_defrag<<<0, 1024>>>();
+		2d_scan<<<0, 1024>>>();
+		2d_defrag<<<0, 1024>>>();
+		swap();
+		sat_kernel<<<0, 0>>>();
+	}
+}
+
+/**************************** MAIN *******************************/
 
 int main() {
 	int n;
