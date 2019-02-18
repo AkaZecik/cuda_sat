@@ -16,15 +16,15 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 struct clause {
 	/* Field 'flags':
-	 *   0x01u - value of literal l[0]
-	 *   0x02u - value of literal l[1]
-	 *   0x04u - value of literal l[2]
-	 *   0x08u - literal l[0] was assigned
-	 *   0x10u - literal l[1] was assigned
-	 *   0x20u - literal l[2] was assigned
-	 * Satisfied if: (c.flags & 0x07u) != 0x00u
-	 * Has literals: (c.flags & 0x38) != 0x38u
-	 * Invalid if: (c.flags & 0x3fu) == 0x2au
+	 *   0x01u - value of literal l[0] (taking into account the sign)
+	 *   0x02u - value of literal l[1] (taking into account the sign)
+	 *   0x04u - value of literal l[2] (taking into account the sign)
+	 *   0x08u - literal l[0] was assigned a value
+	 *   0x10u - literal l[1] was assigned a value
+	 *   0x20u - literal l[2] was assigned a value
+	 * Satisfied if: (flags & 0x07u) != 0x00u
+	 * Has literals: (flags & 0x38u) != 0x38u
+	 * Invalid if:   (flags & 0x3fu) == 0x2au
 	 */
 	int8_t l[3];
 	uint8_t flags;
@@ -41,6 +41,8 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
 	clause *formula = d_f1 + warp_id * r;
 	unsigned int *valid = d_v + warp_id; // check
 
+	// dodac ifa jezeli jestesmy warpem niezerowym? on juz ma te dane przeciez?
+	// o nie... musi byc osobna tablica... co jak warp 0 juz zabierze sie do roboty?
 	for(int i = threadIdx.x & 31; i < r; ++i) {
 		formula[i] = d_f1[i];
 	}
@@ -53,9 +55,10 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
 		number = tmp;
 		clause fc;
 		bool fc_found = false;
+		unsigned int mask1 = 0xffffffffu; // check
 
 		for(int i = lane_id; true; i += 32) {
-			unsigned int mask1 = __ballot_sync(0xffffffffu, i < r);
+			mask1 = __ballot_sync(mask1, i < r); // check for second loop
 
 			if(i >= r) {
 				break;
@@ -65,7 +68,7 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
 
 			if(!fc_found) {
 				int has_literals = c_has(cl); // check and/or improve
-				int mask2 = __ballot_sync(mask1, has_literals);
+				int mask2 = __ballot_sync(mask1, has_literals); // check if it is OK
 
 				if(!mask2) {
 					continue;
@@ -76,6 +79,14 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
 				int src_lane_id = __ffs(mask2) - 1;
 				tmp = __shfl_sync(mask1, *ptr_cl, src_lane_id);
 				fc = *((clause *) &tmp);
+
+				if(!(fc.flags & (0x08u << branch_id))) {
+					if(lane_id == 0) {
+						*valid = 0;
+					}
+
+					return;
+				}
 			}
 
 			for(int l = 0; l < 3; ++l) {
@@ -90,14 +101,21 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
 				}
 			}
 
-			if((cl.flags & 0x3fu) == 0x2au) {
-				*valid = 0;
+			if(__any_sync(0xffffffffu, c_inv(cl))) {
+				if(lane_id == 0) {
+					*valid = 0;
+				}
+
+				return;
 			}
 
 			formula[i] = cl;
 		}
 
-		if(!fc_found
+		if(!fc_found) {
+			// whole formula satisfied! I think...
+			return;
+		}
 	}
 }
 
@@ -111,21 +129,30 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
  * r - total number of clauses
  */
 __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k, int r) {
+	int lane_id = threadIdx.x & 31;
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
 	unsigned int *valid = d_v + k * branch_id + formula_id;
 	clause *formula = d_f1 + formula_id * r;
 	clause *destination = d_f2 + (branch_id * k + formula_id) * r;
-	clause fc = formula[0]; // this might be slow
+	clause fc = formula[0]; // this might be slow, use __shfl_sync()?
 
+	// check
 	if(!(fc.flags & (0x08u << branch_id))) {
-		*valid = 0;
+		if(lane_id == 0) {
+			*valid = 0;
+		}
+
 		return;
 	}
 
-	for(int i = threadIdx.x & 31; i < r; i += 32) {
-		clause cl = formula[i]; // dodac check czy formula jest nullowalna
+	for(int i = lane_id; i < r; i += 32) {
+		clause cl = formula[i];
+
+		if(c_sat(cl)) { // sprawdzic czy jest dobrze: jak jest nullowalna, to uciekaj
+			break;
+		}
 
 		for(int l = 0; l < 3; ++l) {
 			for(int x = 0; x < branch_id; ++x) {
@@ -139,8 +166,13 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 			}
 		}
 
-		if((cl.flags & 0x3fu) == 0x2au) {
-			*valid = 0;
+		// check
+		if(__any_sync(0xffffffffu, c_inv(cl))) {
+			if(lane_id == 0) {
+				*valid = 0;
+			}
+
+			return;
 		}
 
 		destination[i] = cl;
@@ -151,7 +183,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 
 __device__ volatile unsigned int id = 0;
 __device__ volatile unsigned int d_p[32];
-__device__ volatile unsigned int last;
+__device__ volatile unsigned int valid_f;
 
 __inline__ __device__ unsigned int warp_scan(unsigned int v) {
 	int lane_id = threadIdx.x & 31;
@@ -233,7 +265,7 @@ __global__ void 1d_propagate(unsigned int *d_v, int k, int range_parts, int rang
 	}
 
 	if(tid == k + 1023) {
-		last = v;
+		valid_f = v;
 	}
 }
 
@@ -244,7 +276,7 @@ __global__ void 1d_scatter(clause *d_f1, clause *d_f2, int *d_v, int k, int r) {
 	unsigned int v = d_v[warp_id];
 	unsigned int valid = v & 0x80000000u;
 	clause *formula = d_f2 + warp_id * r;
-	clause *destination = d_f1 + (valid ? position - 1 : last + warp_id - position) * r;
+	clause *destination = d_f1 + (valid ? position - 1 : valid_f + warp_id - position) * r;
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
 		destination[i] = formula[i];
@@ -283,7 +315,7 @@ __global__ void 2d_scan(clause *d_f1, int *d_v, int k, int r, int range_parts, i
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
 		int remainder = tid % r; // da sie ifami, ale remainder zwiekszam o 1024%r if(remainder >= r) { remainder -= r; }
 	clause cl = d_f1[tid];
-	unsigned int satisfied = (cl.flags & 0x07u) ? 0 : 0x80000001u;
+	unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u;
 	unsigned int v = warp_scan(satisfied, reminder, lane_id);
 
 	if(lane_id == 31) {
@@ -340,32 +372,59 @@ __global__ void 2d_scatter(clause *d_f1, clause *d_f2, int *d_v, int r) {
 
 /**************************** SWAP *******************************/
 
-void swap() {
+__managed__ bool formula_satisfied = false; // pewnie wyzej umiescic i sprawdzic kiedys???
 
+void swap() {
+	
 }
 
 /************************** PIPELINE *****************************/
-void pipeline() {
-	while(true) {
-		1d_scan<<<0, 0>>>();
-		1d_defrag<<<0, 1024>>>();
-		2d_scan<<<0, 1024>>>();
-		2d_defrag<<<0, 1024>>>();
-		swap();
-		sat_kernel<<<0, 0>>>();
+void pipeline(std::vector<clause> &formulas, int n, int r, int s) {
+	// in main
+}
+
+/************************ EXTRACT_VARS ***************************/
+
+// from a formula, extracts variables
+
+void extract_vars(clause *formula, int r, std::vector<bool> &assignment) {
+	for(int i = 0; i < r; ++i) {
+		for(int j = 0; j < 3; ++j) {
+			int8_t var = formula[i].l[j];
+			bool val = formula[i].flags & (0x01u << j);
+			bool set = formula[i].flags & (0x08u << j);
+
+			if(set) {
+				assignment[abs8(var)] = (var < 0) ^ val; 
+			}
+		}
 	}
 }
 
 /**************************** MAIN *******************************/
 
 int main() {
-	int n;
-	int r;
-	int s;
-	unsigned int *d_f1;
-	unsigned int *d_f2;
-	cudaMallocHost(&d_f_1, ... * r * sizeof(clause));
-	cudaMallocHost(&d_f_2, ... * r * sizeof(clause));
+	int n, r, s;
+	int number_of_formulas = 1;
+	std::vector<clause> formulas(BATCH_SIZE * r);
+
+	clause *d_f1;
+	clause *d_f2;
+	unsigned int *d_v;
+	cudaMallocHost(&d_f1, BATCH_SIZE * r * sizeof(clause));
+	cudaMallocHost(&d_f2, BATCH_SIZE * r * sizeof(clause));
+	cudaMallocHost(&d_v, BATCH_SIZE * sizeof(unsigned int));
+
+	preprocess<<<0, 0>>>(d_f1, d_f2, d_v, BATCH_SIZE, r);
+
+	while(true) {
+		1d_scan<<<0, 0>>>(d_v, number_of_formulas /* ??? */, range_parts, range);
+		1d_defrag<<<0, 1024>>>(d_f1);
+		2d_scan<<<0, 1024>>>(d_f1, d_v, range_parts, range);
+		2d_defrag<<<0, 1024>>>(d_f1, d_f2, d_v, r);
+		swap();
+		sat_kernel<<<0, 0>>>(d_f1, d_f2, d_v, BATCH_SIZE, r);
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////
