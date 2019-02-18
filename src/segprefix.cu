@@ -22,11 +22,15 @@ struct clause {
 	 *   0x08u - literal l[0] was assigned
 	 *   0x10u - literal l[1] was assigned
 	 *   0x20u - literal l[2] was assigned
-	 * Nullified if: !((c.flags & 0x38u) && (c.flags & 0x07u))
+	 * Satisfied if: (c.flags & 0x07u) != 0x00u
+	 * Has literals: (c.flags & 0x38) != 0x38u
 	 * Invalid if: (c.flags & 0x3fu) == 0x2au
 	 */
 	int8_t l[3];
 	uint8_t flags;
+#define c_sat(c) (((c).flags & 0x07u) != 0x00u)
+#define c_has(c) (((c).flags & 0x38u) != 0x38u)
+#define c_inv(c) (((c).flags & 0x3fu) == 0x38u)
 };
 
 /************************* PREPROCESS ****************************/
@@ -60,7 +64,7 @@ __global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
 			clause cl = formula[i];
 
 			if(!fc_found) {
-				int has_literals = cl.flags & 0x38u; // ulepszyc pod fc_found i konczenie loop
+				int has_literals = c_has(cl); // check and/or improve
 				int mask2 = __ballot_sync(mask1, has_literals);
 
 				if(!mask2) {
