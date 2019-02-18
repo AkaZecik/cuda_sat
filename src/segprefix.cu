@@ -9,6 +9,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
+#define BATCH_SIZE 4096
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -28,6 +29,74 @@ struct clause {
 	uint8_t flags;
 };
 
+/************************* PREPROCESS ****************************/
+
+__global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
+	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5); // check
+	int lane_id = threadIdx.x & 31;
+	clause *formula = d_f1 + warp_id * r;
+	unsigned int *valid = d_v + warp_id; // check
+
+	for(int i = threadIdx.x & 31; i < r; ++i) {
+		formula[i] = d_f1[i];
+	}
+	
+	int number = warp_id;
+
+	while(number) { // check
+		int tmp = number / 3;
+		int branch_id = number - 3 * tmp;
+		number = tmp;
+		clause fc;
+		bool fc_found = false;
+
+		for(int i = lane_id; true; i += 32) {
+			unsigned int mask1 = __ballot_sync(0xffffffffu, i < r);
+
+			if(i >= r) {
+				break;
+			}
+
+			clause cl = formula[i];
+
+			if(!fc_found) {
+				int has_literals = cl.flags & 0x38u; // ulepszyc pod fc_found i konczenie loop
+				int mask2 = __ballot_sync(mask1, has_literals);
+
+				if(!mask2) {
+					continue;
+				}
+
+				fc_found = true;
+				int *ptr_cl = (int *) &cl;
+				int src_lane_id = __ffs(mask2) - 1;
+				tmp = __shfl_sync(mask1, *ptr_cl, src_lane_id);
+				fc = *((clause *) &tmp);
+			}
+
+			for(int l = 0; l < 3; ++l) {
+				for(int x = 0; x < branch_id; ++x) {
+					if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
+						cl.flags |= (0x08u + (fc.l[x] < 0)) << l;
+					}
+				}
+
+				if(cl.l[l] == fc.l[branch_id]) {
+					cl.flags |= (0x08u + (fc.l[branch_id] > 0)) << l;
+				}
+			}
+
+			if((cl.flags & 0x3fu) == 0x2au) {
+				*valid = 0;
+			}
+
+			formula[i] = cl;
+		}
+
+		if(!fc_found
+	}
+}
+
 /************************* SAT_KERNEL ****************************/
 
 /* Triples the number of formulas in a batch and marks invalid/missing ones
@@ -37,13 +106,13 @@ struct clause {
  * k - number of formulas to triple
  * r - total number of clauses
  */
-__global__ void sat_kernel(clause *d_f, unsigned int *d_v, int k, int r) {
+__global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k, int r) {
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
 	unsigned int *valid = d_v + k * branch_id + formula_id;
-	clause *formula = d_f + formula_id * r;
-	clause *destination = d_f + ((3 + branch_id) * k + formula_id) * r;
+	clause *formula = d_f1 + formula_id * r;
+	clause *destination = d_f2 + (branch_id * k + formula_id) * r;
 	clause fc = formula[0]; // this might be slow
 
 	if(!(fc.flags & (0x08u << branch_id))) {
@@ -52,12 +121,12 @@ __global__ void sat_kernel(clause *d_f, unsigned int *d_v, int k, int r) {
 	}
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
-		clause cl = formula[i];
+		clause cl = formula[i]; // dodac check czy formula jest nullowalna
 
 		for(int l = 0; l < 3; ++l) {
-			for(int y = 0; y < branch_id; ++y) {
-				if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[y])) {
-					cl.flags |= (0x08u + (fc.l[y] < 0)) << l;
+			for(int x = 0; x < branch_id; ++x) {
+				if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
+					cl.flags |= (0x08u + (fc.l[x] < 0)) << l;
 				}
 			}
 
@@ -123,12 +192,12 @@ __global__ void 1d_scan(unsigned int *d_v, int k, int range_parts, int range) {
 
 		__syncthreads();
 
-		d_v[tid] = v + abs32(prev);
+		d_v[tid] = v + prev;
 
 		__syncthreads();
 
 		if((tid & 1023) == 1023) {
-			prev = v;
+			prev = abs32(v);
 		}
 	}
 
@@ -146,7 +215,7 @@ __global__ void 1d_scan(unsigned int *d_v, int k, int range_parts, int range) {
 __global__ void 1d_propagate(unsigned int *d_v, int k, int range_parts, int range) {
 	__shared__ int prev;
 	int tid = (blockIdx.x + 1) * range + threadIdx.x;
-	
+
 	if(threadIdx.x = 0) {
 		prev = d_p[blockIdx.x];
 	}
@@ -164,14 +233,14 @@ __global__ void 1d_propagate(unsigned int *d_v, int k, int range_parts, int rang
 	}
 }
 
-/************************** 1D_DEFRAG ****************************/
+/************************** 1D_SCATTER ***************************/
 
-__global__ void 1d_defrag(clause *d_f, int *d_v, int k, int r) {
+__global__ void 1d_scatter(clause *d_f1, clause *d_f2, int *d_v, int k, int r) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
 	unsigned int v = d_v[warp_id];
 	unsigned int valid = v & 0x80000000u;
-	clause *formula = d_f + (3 * k + warp_id) * r;
-	clause *destination = d_f + (valid ? position - 1 : last + warp_id - position) * r;
+	clause *formula = d_f2 + warp_id * r;
+	clause *destination = d_f1 + (valid ? position - 1 : last + warp_id - position) * r;
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
 		destination[i] = formula[i];
@@ -180,13 +249,11 @@ __global__ void 1d_defrag(clause *d_f, int *d_v, int k, int r) {
 
 /*************************** 2D_SCAN *****************************/
 
-__inline__ __device__ unsigned int warp_scan(unsigned int v, bool first) {
-	int lane_id = threadIdx.x & 31;
-
+__inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int lane_id) {
 	for(int i = 1; i < 32; i <<= 1) {
 		int _v = __shfl_up_sync(0xffffffffu, v, i);
 
-		if(lane_id >= i && !first) {
+		if(lane_id >= i && i <= reminder) { // chyba dobrze
 			v += abs32(_v);
 		}
 	}
@@ -194,13 +261,13 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, bool first) {
 	return v;
 }
 
-__global__ void 2d_scan(int *d_f, int *d_v, int k, int r, int range_parts, int range) {
-	/////////////////// NOT DONE YET! ///////////////////////
+__global__ void 2d_scan(clause *d_f1, int *d_v, int k, int r, int range_parts, int range) {
 	__shared__ partials[33];
 	__shared__ prev;
 	int tid = blockIdx.x * range + threadIdx.x;
 	int warp_id = threadIdx.x >> 5;
 	int lane_id = threadIdx.x & 31;
+	int range_start = tid;
 
 	if(tid == 0) {
 		values[0] = 0;
@@ -210,32 +277,32 @@ __global__ void 2d_scan(int *d_f, int *d_v, int k, int r, int range_parts, int r
 	__syncthreads();
 
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		clause cl = d_v[tid];
-		unsigned int satisfied = (cl.flags & 0x07u) ? 0 : 0x80000001u;
-		bool first = tid % r == 0;
-		unsigned int v = warp_scan(satisfied, first);
+		int remainder = tid % r; // da sie ifami, ale remainder zwiekszam o 1024%r if(remainder >= r) { remainder -= r; }
+	clause cl = d_f1[tid];
+	unsigned int satisfied = (cl.flags & 0x07u) ? 0 : 0x80000001u;
+	unsigned int v = warp_scan(satisfied, reminder, lane_id);
 
-		if(lane_id == 31) {
-			values[warp_id + 1] = v;
-		}
+	if(lane_id == 31) {
+		values[warp_id + 1] = v;
+	}
 
-		__syncthreads();
+	__syncthreads();
 
-		if(warp_id == 0) {
-			partials[lane_id] = warp_scan(partials[lane_id]);
-		}
+	if(warp_id == 0) {
+		partials[lane_id] = warp_scan(partials[lane_id]);
+	}
 
-		__syncthreads();
+	__syncthreads();
 
-		if(tid % range < r) { // check ---> jest zle
-			d_v[tid] = v + abs32(prev);
-		}
+	if(tid - range_start <= reminder) { // chyba dobrze
+		d_v[tid] = v + prev;
+	}
 
-		__syncthreads();
+	__syncthreads();
 
-		if((tid & 1023) == 1023) {
-			prev = v;
-		}
+	if((tid & 1023) == 1023) {
+		prev = abs32(v);
+	}
 	}
 
 	if((tid & 1023) == 1023) {
@@ -247,17 +314,33 @@ __global__ void 2d_scan(int *d_f, int *d_v, int k, int r, int range_parts, int r
 			d_p[lane_id] = warp_scan(d_p[lane_id]);
 		}
 	}
-	/////////////////// NOT DONE YET! ///////////////////////
 }
 
-/************************** 2D_DEFRAG ****************************/
+// NIE MA 2D_PROPAGATE
 
-__global__ void 2d_defrag(clause *d_f, int *d_v, ) {
+/************************** 2D_SCATTER ***************************/
 
+__global__ void 2d_scatter(clause *d_f1, clause *d_f2, int *d_v, int r) {
+	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
+	int shift = warp_id * r;
+	int *position = d_v + shift;
+	clause *formula = d_f1 + shift;
+	clause *destination = d_f2 + shift;
+
+	for(int i = threadIdx.x & 31; i < r; i += 32) {
+		unsigned int satisfied = v & 0x80000000u;
+		int p = position[i];
+		destination[satisfied ? p - 1 : last + warp_id - p] = formula[i];
+	}
 }
 
 /**************************** SWAP *******************************/
 
+void swap() {
+
+}
+
+/************************** PIPELINE *****************************/
 void pipeline() {
 	while(true) {
 		1d_scan<<<0, 0>>>();
@@ -275,6 +358,10 @@ int main() {
 	int n;
 	int r;
 	int s;
+	unsigned int *d_f1;
+	unsigned int *d_f2;
+	cudaMallocHost(&d_f_1, ... * r * sizeof(clause));
+	cudaMallocHost(&d_f_2, ... * r * sizeof(clause));
 }
 
 ////////////////////////////////////////////////////////////////////////
