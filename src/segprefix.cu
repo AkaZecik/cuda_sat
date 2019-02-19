@@ -38,10 +38,10 @@ __managed__ bool formula_satisfied = false;
 
 /************************* PREPROCESS ****************************/
 
-__global__ void preprocess(clause *d_f1, unsigned int *d_v, int r) {
+__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r) {
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5); // check
 	int lane_id = threadIdx.x & 31;
-	clause *formula = d_f1 + warp_id * r;
+	clause *formula = d_f2 + warp_id * r;
 	unsigned int *valid = d_v + warp_id; // check
 
 	// dodac ifa jezeli jestesmy warpem niezerowym? on juz ma te dane przeciez?
@@ -275,7 +275,7 @@ __global__ void propagate_1d(unsigned int *d_v, int k, int range_parts, int rang
 
 /************************** SCATTER_1D ***************************/
 
-__global__ void scatter_1d(clause *d_f1, clause *d_f2, int *d_v, int r) {
+__global__ void scatter_1d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
 	unsigned int p = d_v[warp_id];
 	unsigned int valid = p & 0x80000000u;
@@ -301,13 +301,15 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int l
 	return v;
 }
 
-__global__ void scan_2d(clause *d_f1, int *d_v, int k, int r, int range_parts, int range) {
+__global__ void scan_2d(clause *d_f1, unsigned int *d_v, int k, int r, int range_parts, int range) {
 	__shared__ int partials[33];
 	__shared__ int prev;
 	int tid = blockIdx.x * range + threadIdx.x;
 	int warp_id = threadIdx.x >> 5;
 	int lane_id = threadIdx.x & 31;
 	int range_start = tid;
+	int remainder = tid % r;
+	int rem_inc = 1024 % r; // check
 
 	if(tid == 0) {
 		partials[0] = 0;
@@ -317,11 +319,9 @@ __global__ void scan_2d(clause *d_f1, int *d_v, int k, int r, int range_parts, i
 	__syncthreads();
 
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		// da sie ifami, ale remainder zwiekszam o 1024%r if(remainder >= r) { remainder -= r; }
-		int reminder = tid % r;
 		clause cl = d_f1[tid];
 		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u;
-		unsigned int v = warp_scan(satisfied, reminder, lane_id);
+		unsigned int v = warp_scan(satisfied, remainder, lane_id);
 
 		if(lane_id == 31) {
 			partials[warp_id + 1] = v;
@@ -335,7 +335,7 @@ __global__ void scan_2d(clause *d_f1, int *d_v, int k, int r, int range_parts, i
 
 		__syncthreads();
 
-		if(tid - range_start <= reminder) { // chyba dobrze
+		if(tid - range_start < remainder) { // check
 			d_v[tid] = v + prev;
 		}
 
@@ -344,9 +344,15 @@ __global__ void scan_2d(clause *d_f1, int *d_v, int k, int r, int range_parts, i
 		if((tid & 1023) == 1023) {
 			prev = abs32(v);
 		}
+
+		remainder += rem_inc;
+
+		if(remainder >= r) { // check
+			remainder -= r;
+		}
 	}
 
-	if((tid & 1023) == 1023) {
+	if((tid & 1023) == 1023) { // check?
 		d_p[blockIdx.x] = prev;
 		__threadfence();
 
@@ -357,14 +363,41 @@ __global__ void scan_2d(clause *d_f1, int *d_v, int k, int r, int range_parts, i
 	}
 }
 
-// NIE MA 2D_PROPAGATE :<
+__global__ void propagate_2d(unsigned int *d_v, int k, int r, int range_parts, int range) {
+	// ogarnij co z tym 'k'
+	__shared__ int prev;
+	int tid = (blockIdx.x + 1) * range + threadIdx.x;
+	int range_start = tid;
+	int remainder = tid % r;
+	int rem_inc = 1024 % r; // wyniesc poza funkcje?
+
+	if(threadIdx.x == 0) {
+		prev = d_p[blockIdx.x];
+	}
+
+	__syncthreads();
+
+	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+		if(tid - range_start >= remainder) { // check
+			return;
+		}
+		
+		d_v[tid] += prev;
+		remainder += rem_inc;
+
+		if(remainder >= r) {
+			remainder -= r;
+		}
+
+	}
+}
 
 /************************** SCATTER_2D ***************************/
 
-__global__ void scatter_2d(clause *d_f1, clause *d_f2, int *d_v, int r) {
+__global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
 	int shift = warp_id * r;
-	int *position = d_v + shift;
+	unsigned int *position = d_v + shift;
 	clause *formula = d_f1 + shift;
 	clause *destination = d_f2 + shift;
 
@@ -427,8 +460,26 @@ void print_formula(clause *formula, int r) {
 
 /**************************** SWAP *******************************/
 
-void swap() {
+void swap(std::vector<clause> &storage, clause *d_f1, clause *d_f2, int nb_of_formulas, int s, int r) {
+	int surplus = nb_of_formulas - s/3;
 
+	if(surplus > 0) {
+		int transfer = surplus * r;
+		storage.resize(storage.size() + transfer);
+		clause *dst = storage.data() + storage.size() - transfer;
+		clause *src = d_f1 + nb_of_formulas * r - transfer;
+		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
+		nb_of_formulas -= surplus;
+	}
+
+	if(surplus < 0) {
+		int transfer = -surplus * r;
+		clause *dst = d_f1 + nb_of_formulas * r;
+		clause *src = storage.data() + storage.size() - transfer;
+		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
+		storage.resize(storage.size() - transfer);
+		nb_of_formulas += -surplus;
+	}
 }
 
 /************************** PIPELINE *****************************/
@@ -445,7 +496,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s) {
 	storage.resize(0);
 
 	// spawns ceil(s/32) warps, each warp generating a singe new formula
-	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, nb_of_formulas, r);
+	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r);
 
 	// czy powinna zwrocic prawdziwe 's'?
 
@@ -460,12 +511,12 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s) {
 		}
 
 		int range_parts = (nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
-		int range = parts * 1024;
+		int range = range_parts * 1024;
 		int blocks = (s + range - 1) / range;
 		scan_1d<<<blocks, 1024>>>(d_v, s, range_parts, range);
 
 		if(blocks > 1) {
-			propagate_1d<<<blocks - 1, 1024>>>(d_v, range_parts, range); 
+			propagate_1d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, range_parts, range); //check
 		}
 
 		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r);
@@ -473,37 +524,17 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s) {
 
 		nb_of_formulas = nb_of_valid;
 		range_parts = (r * nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
-		range = parts * 1024;
+		range = range_parts * 1024;
 		blocks = (s + range - 1) / range;
 
-		scan_2d<<<blocks, 1024>>>(d_v, r * nb_of_formulas, range_parts, range); // check
+		scan_2d<<<blocks, 1024>>>(d_f1, d_v, nb_of_formulas, r * nb_of_formulas, range_parts, range); // check
 
 		if(blocks > 1) {
-			propagate_2d<<<blocks - 1, 1024>>>(d_f1, d_f2, d_v, r); // check order
+			propagate_2d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, r, range_parts, range); // check order
 		}
 
 		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r);
-
-		int surplus = nb_of_formulas - s/3;
-
-		if(surplus > 0) {
-			int transfer = surplus * r;
-			storage.resize(storage.size() + transfer);
-			clause *dst = storage.data() + storage.size() - transfer;
-			clause *src = d_f1 + nb_of_formulas * r - transfer;
-			gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
-			nb_of_formulas -= surplus;
-		}
-
-		if(surplus < 0) {
-			int transfer = -surplus * r;
-			clause *dst = d_f1 + nb_of_formulas * r;
-			clause *src = storage.data() + storage.size() - transfer;
-			gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
-			storage.resize(storage.size() - transfer);
-			nb_of_formulas += -surplus;
-		}
-
+		swap(storage, d_f1, d_f2, nb_of_formulas, s, r);
 		sat_kernel<<<(nb_of_formulas + 31) / 32, 32 * WARPS_NB>>>(d_f1, d_f2, d_v, nb_of_formulas, r);
 		// czy nie blokujemy?
 	}
