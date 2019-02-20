@@ -10,7 +10,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
-#define BATCH_SIZE 4096
+#define BATCH_SIZE 27
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -24,66 +24,71 @@ struct clause {
 	 *   0x10u - literal l[1] was assigned a value
 	 *   0x20u - literal l[2] was assigned a value
 	 * Satisfied if: (flags & 0x07u) != 0x00u
-	 * Has literals: (flags & 0x38u) != 0x38u
 	 * Invalid if:   (flags & 0x3fu) == 0x2au
+	 * Has literals: not satisfied and not invalid
 	 */
 	uint8_t l[3];
 	uint8_t flags;
 #define c_sat(c) (((c).flags & 0x07u) != 0x00u)
-#define c_has(c) (((c).flags & 0x38u) != 0x38u)
 #define c_inv(c) (((c).flags & 0x3fu) == 0x38u)
+#define c_has(c) (!c_sat(c) && !c_inv(c))
 };
 
 __managed__ bool formula_satisfied = false;
 
 /************************* PREPROCESS ****************************/
 
-__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r) {
-	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5); // check
+__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int log3) {
+	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5); // check
 	int lane_id = threadIdx.x & 31;
 	clause *formula = d_f2 + warp_id * r;
 	unsigned int *valid = d_v + warp_id; // check
 
-	// dodac ifa jezeli jestesmy warpem niezerowym? on juz ma te dane przeciez?
-	// o nie... musi byc osobna tablica... co jak warp 0 juz zabierze sie do roboty?
-	for(int i = threadIdx.x & 31; i < r; ++i) {
+	for(int i = lane_id; i < r; i += 32) {
 		formula[i] = d_f1[i];
 	}
 
+	__syncwarp();
+
 	int number = warp_id;
 
-	while(number) { // check
+	for(int t = 0; t < log3; ++t) {
 		int tmp = number / 3;
 		int branch_id = number - 3 * tmp;
 		number = tmp;
+
 		clause fc;
+		clause cl;
 		bool fc_found = false;
-		unsigned int mask1 = 0xffffffffu; // check
+		bool invalid = false;
+		unsigned int mask1 = 0xffffffffu;
 
 		for(int i = lane_id; true; i += 32) {
 			mask1 = __ballot_sync(mask1, i < r); // check for second loop
 
-			if(i >= r) {
+			if(!mask1) {
 				break;
 			}
 
-			clause cl = formula[i];
+			if(i < r) {
+				cl = formula[i];
+			}
 
 			if(!fc_found) {
-				int has_literals = c_has(cl); // check and/or improve
-				int mask2 = __ballot_sync(mask1, has_literals); // check if it is OK
+				int has_literals = c_has(cl); // check/improve
+				int mask2 = __ballot_sync(mask1, has_literals);
 
 				if(!mask2) {
 					continue;
 				}
 
-				fc_found = true;
+				fc_found = true; // ZLE W KONTEKSCIE i >= r
 				int *ptr_cl = (int *) &cl;
 				int src_lane_id = __ffs(mask2) - 1;
 				tmp = __shfl_sync(mask1, *ptr_cl, src_lane_id);
 				fc = *((clause *) &tmp);
 
-				if(!(fc.flags & (0x08u << branch_id))) {
+				if(fc.l[branch_id] == 0) {
 					if(lane_id == 0) {
 						*valid = 0;
 					}
@@ -104,7 +109,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r)
 				}
 			}
 
-			if(__any_sync(0xffffffffu, c_inv(cl))) {
+			if(__any_sync(mask1, c_inv(cl))) { // all threads within a warp need to know that!
 				if(lane_id == 0) {
 					*valid = 0;
 				}
@@ -112,11 +117,14 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r)
 				return;
 			}
 
+			//printf("(warp_id: %d, lane_id: %d) substituting clause %d, flags are: 0x%02x\n", warp_id, lane_id, i + 1, cl.flags);
 			formula[i] = cl;
+			__syncwarp(mask1); // necessary?
 		}
 
-		if(!fc_found) {
+		if(!fc_found) { // what about the threads that were i >= r? they will continue the loop
 			// whole formula satisfied! I think...
+			formula_satisfied = true;
 			return;
 		}
 	}
@@ -438,7 +446,7 @@ void print_formula(clause *formula, int r) {
 			printf(" ");
 		}
 
-		printf(" - ");
+		printf("\t");
 
 		for(int j = 0; j < 3; ++j) {
 			if(ptr[j] & 0x80u) {
@@ -447,12 +455,42 @@ void print_formula(clause *formula, int r) {
 				printf("%d", ptr[j]);
 			}
 
+			printf("\t");
+		}
+
+		for(int j = 0; j < 3; ++j) {
+			uint8_t flag = (ptr[3] & (0x09u << j)) >> j;
+
+			if(ptr[j] != 0 && (flag & 0x08u)) {
+				if((flag & 0x01u) ^ ((ptr[j] & 0x80u) >> j)) {
+					printf("true");
+				} else {
+					printf("false");
+				}
+			} else {
+				printf("X");
+			}
+
 			if(j != 2) {
 				printf("\t");
 			}
 		}
 
 		printf("\n");
+	}
+
+	printf("\n");
+}
+
+void print_batch(clause *d_f1, int nb_of_formulas, int r) {
+	gpuErrchk(cudaDeviceSynchronize());
+	std::vector<clause> storage(nb_of_formulas * r);
+	gpuErrchk(cudaMemcpy(storage.data(), d_f1, storage.size() * sizeof(clause), cudaMemcpyDefault));
+	printf("-------------------------------- BATCH -------------------------------------\n");
+
+	for(int i = 0; i < nb_of_formulas; ++i) {
+		printf("----- FORMULA %d/%d -----\n", i + 1, storage.size());
+		print_formula(storage.data() + i * r, r);
 	}
 
 	printf("\n");
@@ -484,19 +522,21 @@ void swap(std::vector<clause> &storage, clause *d_f1, clause *d_f2, int nb_of_fo
 
 /************************** PIPELINE *****************************/
 
-void pipeline(std::vector<clause> &storage, int n, int r, int s) {
+void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3) {
 	int nb_of_formulas = s;
 	clause *d_f1;
 	clause *d_f2;
 	unsigned int *d_v;
-	gpuErrchk(cudaMallocHost(&d_f1, s * r * sizeof(clause)));
-	gpuErrchk(cudaMallocHost(&d_f2, s * r * sizeof(clause)));
-	gpuErrchk(cudaMallocHost(&d_v, s * sizeof(unsigned int)));
-	gpuErrchk(cudaMemcpy(&d_f1, storage.data(), r * sizeof(clause), cudaMemcpyDefault));
+	gpuErrchk(cudaMalloc(&d_f1, s * r * sizeof(clause)));
+	gpuErrchk(cudaMalloc(&d_f2, s * r * sizeof(clause)));
+	gpuErrchk(cudaMalloc(&d_v, s * sizeof(unsigned int)));
+	gpuErrchk(cudaMemcpy(d_f1, storage.data(), r * sizeof(clause), cudaMemcpyDefault));
 	storage.resize(0);
 
 	// spawns ceil(s/32) warps, each warp generating a singe new formula
-	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r);
+	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3);
+	print_batch(d_f2, nb_of_formulas, r);
+	return; // --------------------------------
 
 	// czy powinna zwrocic prawdziwe 's'?
 
@@ -550,9 +590,11 @@ int main() {
 	int n, r;
 	scanf("%d %d", &n, &r);
 	int s = 1;
+	int log3 = 0;
 
 	while(3 * s <= BATCH_SIZE) {
 		s *= 3;
+		++log3;
 	}
 
 	std::vector<clause> formulas(BATCH_SIZE * r);
@@ -578,12 +620,12 @@ int main() {
 		}
 
 		while(j < 3) {
-			formulas[i].flags &= 0x8u << j;
+			formulas[i].flags |= 0x8u << j;
 			++j;
 		}
 	}
 
 	print_formula(formulas.data(), r);
-	pipeline(formulas, n, r, s);
+	pipeline(formulas, n, r, s, log3);
 
 }
