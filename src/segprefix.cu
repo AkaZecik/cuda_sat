@@ -29,12 +29,17 @@ struct clause {
 	 */
 	uint8_t l[3];
 	uint8_t flags;
+//
 #define c_sat(c) (((c).flags & 0x07u) != 0x00u)
+
+// 
 #define c_inv(c) (((c).flags & 0x3fu) == 0x38u)
+
+// there is any reason to substitute any literal to get the formula satisfied
 #define c_has(c) (!c_sat(c) && !c_inv(c))
 };
 
-__managed__ bool formula_satisfied = false; // consider making an id of satisfied var
+__managed__ bool formula_satisfied = false; // consider making a position of a satisfied formula
 
 /************************* PREPROCESS ****************************/
 
@@ -78,10 +83,10 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 			tmp = __shfl_sync(0xffffffffu, *ptr_fc, src_lane_id);
 			fc = *((clause *) &tmp);
 
-			if(fc.l[branch_id] == 0) {
+			if(fc.flags & (0x08u << branch_id)) { // chyba OK
 				if(lane_id == 0) {
-					*valid = 0x80000001u;
-					// printf("[1] oh no! invalid formula %d\n", warp_id);
+					printf("formula %d dying (literal cannot be substituted)\n", warp_id);
+					*valid = 1;
 				}
 
 				return;
@@ -104,21 +109,28 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 				for(int l = 0; l < 3; ++l) {
 					for(int x = 0; x < branch_id; ++x) {
-						if(abs8(cl.l[l]) == abs8(fc.l[x])) {
-							cl.flags |= (0x08u + ((fc.l[x] & 0x80u) == 0x80u)) << l;
+						if(abs8(cl.l[l]) == abs8(fc.l[x])) { // CHECK!!!!!!!!!!!!!!!!!!!!!
+							bool fc_neg = fc.l[x] & 0x80u;
+							bool cl_neg = cl.l[l] & 0x80u;
+							cl.flags |= (0x09u - (fc_neg == cl_neg)) << l;
+
+							// cl.flags |= (0x08u + ((cl.l[x] & 0x80u) == 0x80u)) << l; // check!
 						}
 					}
 
 					if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
-						cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
+						bool fc_neg = fc.l[branch_id] & 0x80u;
+						bool cl_neg = cl.l[l] & 0x80u;
+						cl.flags |= (0x08u + (fc_neg == cl_neg)) << l;
+
+						// cl.flags |= (0x08u + ((cl.l[branch_id] & 0x80u) == 0)) << l; // check!
 					}
 				}
 			}
 
 			if(__any_sync(0xffffffffu, i < r ? c_inv(cl) : 0)) { // check
 				if(lane_id == 0) {
-					*valid = 0x80000001u; // check
-					// printf("[2] oh no! invalid formula %d\n", warp_id);
+					*valid = 1; // check
 				}
 
 				return;
@@ -144,7 +156,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
  */
 __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k, int r) {
 	int lane_id = threadIdx.x & 31;
-	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
+	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5); // CHECK! czy nie? tu jest OK?
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
 	unsigned int *valid = d_v + k * branch_id + formula_id;
@@ -152,10 +164,9 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 	clause *destination = d_f2 + (branch_id * k + formula_id) * r;
 	clause fc = formula[0]; // this might be slow, use __shfl_sync()?
 
-	// check
-	if(!(fc.flags & (0x08u << branch_id))) { // fc.l[branch_id] == 0
+	if(fc.flags & (0x08u << branch_id)) { // CHECK!!!!!!!!!!!!!!
 		if(lane_id == 0) {
-			*valid = 0x80000001u; // check
+			*valid = 1;
 		}
 
 		return;
@@ -165,7 +176,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 		clause cl = formula[i];
 
 		if(c_sat(cl)) { // sprawdzic czy jest dobrze: jak jest nullowalna, to uciekaj
-			break;
+			return;
 		}
 
 		for(int l = 0; l < 3; ++l) {
@@ -180,10 +191,9 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 			}
 		}
 
-		// check
-		if(__any_sync(0xffffffffu, c_inv(cl))) {
+		if(__any_sync(0xffffffffu, c_inv(cl))) { // chyba ok, czy poprawic? petla jest i < r
 			if(lane_id == 0) {
-				*valid = 0x80000001u; // check
+				*valid = 1; // check
 			}
 
 			return;
@@ -228,7 +238,7 @@ __global__ void scan_1d(unsigned int *d_v, int k, int range_parts, int range) {
 	__syncthreads();
 
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		unsigned int v = warp_scan(d_v[tid]); // swap d_v[tid] between 0 and 0x80000001u
+		unsigned int v = warp_scan(d_v[tid] ? 0 : 0x80000001u); // check
 
 		if(lane_id == 31) {
 			partials[warp_id + 1] = v;
@@ -304,7 +314,7 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int l
 	for(int i = 1; i < 32; i <<= 1) {
 		int _v = __shfl_up_sync(0xffffffffu, v, i);
 
-		if(lane_id >= i && i <= reminder) { // chyba dobrze
+		if(lane_id >= i && i <= reminder) { // check, should be < or <=?
 			v += abs32(_v);
 		}
 	}
@@ -346,7 +356,7 @@ __global__ void scan_2d(clause *d_f1, unsigned int *d_v, int k, int r, int range
 
 		__syncthreads();
 
-		if(tid - range_start < remainder) { // check
+		if(tid - range_start < remainder) { // check, < or <=?
 			d_v[tid] = v + prev;
 		}
 
@@ -465,7 +475,7 @@ void print_formula(clause *formula, int r) {
 			uint8_t flag = (ptr[3] & (0x09u << j)) >> j;
 
 			if(ptr[j] != 0 && (flag & 0x08u)) {
-				if((flag & 0x01u) ^ ((ptr[j] & 0x80u) >> j)) {
+				if((flag & 0x01u) /*^ ((ptr[j] & 0x80u) >> j)*/) {
 					printf("true");
 				} else {
 					printf("false");
@@ -496,7 +506,7 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
 		printf("----- FORMULA %d/%d -----\n", i + 1, nb_of_formulas);
-		printf("Validity: 0x%08x\n", validities[i]);
+		printf("Formula %s\n", validities[i] ? "is invalid" : "may be valid");
 		print_formula(storage.data() + i * r, r);
 	}
 
@@ -628,7 +638,7 @@ int main() {
 		}
 
 		while(j < 3) {
-			formulas[i].flags |= 0x8u << j;
+			formulas[i].flags |= 0x08u << j;
 			++j;
 		}
 	}
@@ -637,3 +647,5 @@ int main() {
 	pipeline(formulas, n, r, s, log3r);
 
 }
+
+// TODO: generalize 1024 to blockDim.x
