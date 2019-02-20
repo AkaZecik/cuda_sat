@@ -38,9 +38,10 @@ __managed__ bool formula_satisfied = false;
 
 /************************* PREPROCESS ****************************/
 
-__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int log3) {
+__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int log3r) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5); // check
 	int lane_id = threadIdx.x & 31;
+	int number = warp_id;
 	clause *formula = d_f2 + warp_id * r;
 	unsigned int *valid = d_v + warp_id; // check
 
@@ -50,66 +51,65 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 	__syncwarp();
 
-	int number = warp_id;
 
-	for(int t = 0; t < log3; ++t) {
+	for(int t = 0; t < log3r; ++t) {
 		int tmp = number / 3;
 		int branch_id = number - 3 * tmp;
 		number = tmp;
 
 		clause fc;
-		clause cl;
 		bool fc_found = false;
-		bool invalid = false;
-		unsigned int mask1 = 0xffffffffu;
 
-		for(int i = lane_id; true; i += 32) {
-			mask1 = __ballot_sync(mask1, i < r); // check for second loop
+		for(int i = lane_id; !fc_found && __any_sync(0xffffffffu, i < r); i += 32) { // bez sync
+			int mask = __ballot_sync(0xffffffffu, i < r ? c_has(fc = formula[i]) : 0);
 
-			if(!mask1) {
-				break;
+			if(!mask) {
+				continue;
 			}
+
+			fc_found = true;
+			int *ptr_fc = (int *) &fc;
+			int src_lane_id = __ffs(mask) - 1;
+			tmp = __shfl_sync(0xffffffffu, *ptr_fc, src_lane_id);
+			fc = *((clause *) &tmp);
+
+			if(fc.l[branch_id] == 0) {
+				if(lane_id == 0) {
+					*valid = 0;
+				}
+
+				return;
+			}
+		}
+
+		if(!fc_found) {
+			if(lane_id == 0) {
+				*valid = 0;
+			}
+
+			return;
+		}
+
+		for(int i = lane_id; __any_sync(0xfffffffu, i < r); i += 32) { // da sie bez synca
+			clause cl;
 
 			if(i < r) {
 				cl = formula[i];
-			}
 
-			if(!fc_found) {
-				int has_literals = c_has(cl); // check/improve
-				int mask2 = __ballot_sync(mask1, has_literals);
-
-				if(!mask2) {
-					continue;
-				}
-
-				fc_found = true; // ZLE W KONTEKSCIE i >= r
-				int *ptr_cl = (int *) &cl;
-				int src_lane_id = __ffs(mask2) - 1;
-				tmp = __shfl_sync(mask1, *ptr_cl, src_lane_id);
-				fc = *((clause *) &tmp);
-
-				if(fc.l[branch_id] == 0) {
-					if(lane_id == 0) {
-						*valid = 0;
+				for(int l = 0; l < 3; ++l) {
+					for(int x = 0; x < branch_id; ++x) {
+						if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
+							cl.flags |= (0x08u + ((fc.l[x] & 0x80u) == 0x80u)) << l;
+						}
 					}
 
-					return;
-				}
-			}
-
-			for(int l = 0; l < 3; ++l) {
-				for(int x = 0; x < branch_id; ++x) {
-					if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
-						cl.flags |= (0x08u + ((fc.l[x] & 0x80u) == 0x80u)) << l;
+					if(cl.l[l] == fc.l[branch_id]) {
+						cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
 					}
 				}
-
-				if(cl.l[l] == fc.l[branch_id]) {
-					cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
-				}
 			}
 
-			if(__any_sync(mask1, c_inv(cl))) { // all threads within a warp need to know that!
+			if(__any_sync(0xffffffffu, i < r ? c_inv(cl) : 0)) { // check
 				if(lane_id == 0) {
 					*valid = 0;
 				}
@@ -117,15 +117,8 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 				return;
 			}
 
-			//printf("(warp_id: %d, lane_id: %d) substituting clause %d, flags are: 0x%02x\n", warp_id, lane_id, i + 1, cl.flags);
 			formula[i] = cl;
-			__syncwarp(mask1); // necessary?
-		}
-
-		if(!fc_found) { // what about the threads that were i >= r? they will continue the loop
-			// whole formula satisfied! I think...
-			formula_satisfied = true;
-			return;
+			__syncwarp();
 		}
 	}
 }
@@ -389,7 +382,7 @@ __global__ void propagate_2d(unsigned int *d_v, int k, int r, int range_parts, i
 		if(tid - range_start >= remainder) { // check
 			return;
 		}
-		
+
 		d_v[tid] += prev;
 		remainder += rem_inc;
 
@@ -522,7 +515,7 @@ void swap(std::vector<clause> &storage, clause *d_f1, clause *d_f2, int nb_of_fo
 
 /************************** PIPELINE *****************************/
 
-void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3) {
+void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r) {
 	int nb_of_formulas = s;
 	clause *d_f1;
 	clause *d_f2;
@@ -534,7 +527,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3) {
 	storage.resize(0);
 
 	// spawns ceil(s/32) warps, each warp generating a singe new formula
-	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3);
+	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r);
 	print_batch(d_f2, nb_of_formulas, r);
 	return; // --------------------------------
 
@@ -590,11 +583,11 @@ int main() {
 	int n, r;
 	scanf("%d %d", &n, &r);
 	int s = 1;
-	int log3 = 0;
+	int log3r = 0;
 
 	while(3 * s <= BATCH_SIZE) {
 		s *= 3;
-		++log3;
+		++log3r;
 	}
 
 	std::vector<clause> formulas(BATCH_SIZE * r);
@@ -626,6 +619,6 @@ int main() {
 	}
 
 	print_formula(formulas.data(), r);
-	pipeline(formulas, n, r, s, log3);
+	pipeline(formulas, n, r, s, log3r);
 
 }
