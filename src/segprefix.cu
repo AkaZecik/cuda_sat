@@ -10,7 +10,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
-#define BATCH_SIZE 27
+#define BATCH_SIZE 1024
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -85,7 +85,6 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 			if(fc.flags & (0x08u << branch_id)) { // chyba OK
 				if(lane_id == 0) {
-					printf("formula %d dying (literal cannot be substituted)\n", warp_id);
 					*valid = 1;
 				}
 
@@ -113,8 +112,6 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 							bool fc_neg = fc.l[x] & 0x80u;
 							bool cl_neg = cl.l[l] & 0x80u;
 							cl.flags |= (0x09u - (fc_neg == cl_neg)) << l;
-
-							// cl.flags |= (0x08u + ((cl.l[x] & 0x80u) == 0x80u)) << l; // check!
 						}
 					}
 
@@ -122,8 +119,6 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 						bool fc_neg = fc.l[branch_id] & 0x80u;
 						bool cl_neg = cl.l[l] & 0x80u;
 						cl.flags |= (0x08u + (fc_neg == cl_neg)) << l;
-
-						// cl.flags |= (0x08u + ((cl.l[branch_id] & 0x80u) == 0)) << l; // check!
 					}
 				}
 			}
@@ -181,6 +176,23 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 
 		for(int l = 0; l < 3; ++l) {
 			for(int x = 0; x < branch_id; ++x) {
+				if(abs8(cl.l[l]) == abs8(fc.l[x])) { // CHECK!!!!!!!!!!!!!!!!!!!!!
+					bool fc_neg = fc.l[x] & 0x80u;
+					bool cl_neg = cl.l[l] & 0x80u;
+					cl.flags |= (0x09u - (fc_neg == cl_neg)) << l;
+				}
+			}
+
+			if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
+				bool fc_neg = fc.l[branch_id] & 0x80u;
+				bool cl_neg = cl.l[l] & 0x80u;
+				cl.flags |= (0x08u + (fc_neg == cl_neg)) << l;
+			}
+		}
+
+		/*
+		for(int l = 0; l < 3; ++l) {
+			for(int x = 0; x < branch_id; ++x) {
 				if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
 					cl.flags |= (0x08u + ((fc.l[x] & 0x80u) == 0x80u)) << l;
 				}
@@ -190,6 +202,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 				cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
 			}
 		}
+		*/
 
 		if(__any_sync(0xffffffffu, c_inv(cl))) { // chyba ok, czy poprawic? petla jest i < r
 			if(lane_id == 0) {
