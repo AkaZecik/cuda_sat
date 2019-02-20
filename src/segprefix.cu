@@ -34,12 +34,17 @@ struct clause {
 #define c_has(c) (!c_sat(c) && !c_inv(c))
 };
 
-__managed__ bool formula_satisfied = false;
+__managed__ bool formula_satisfied = false; // consider making an id of satisfied var
 
 /************************* PREPROCESS ****************************/
 
-__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int log3r) {
-	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5); // check
+__global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int log3r, int nb_of_formulas) {
+	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
+
+	if(warp_id >= nb_of_formulas) {
+		return;
+	}
+
 	int lane_id = threadIdx.x & 31;
 	int number = warp_id;
 	clause *formula = d_f2 + warp_id * r;
@@ -99,12 +104,12 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 				for(int l = 0; l < 3; ++l) {
 					for(int x = 0; x < branch_id; ++x) {
-						if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
+						if(abs8(cl.l[l]) == abs8(fc.l[x])) {
 							cl.flags |= (0x08u + ((fc.l[x] & 0x80u) == 0x80u)) << l;
 						}
 					}
 
-					if(cl.l[l] == fc.l[branch_id]) {
+					if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
 						cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
 					}
 				}
@@ -170,7 +175,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 				}
 			}
 
-			if(cl.l[l] == fc.l[branch_id]) {
+			if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
 				cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
 			}
 		}
@@ -490,7 +495,7 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	printf("Formula is %s\n\n", formula_satisfied ? "satisfied" : "unsatisfied");
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
-		printf("----- FORMULA %d/%d -----\n", i + 1, storage.size());
+		printf("----- FORMULA %d/%d -----\n", i + 1, nb_of_formulas);
 		printf("Validity: 0x%08x\n", validities[i]);
 		print_formula(storage.data() + i * r, r);
 	}
@@ -537,7 +542,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r) {
 	storage.resize(0);
 
 	// spawns ceil(s/32) warps, each warp generating a singe new formula
-	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r);
+	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
 	print_batch(d_f2, d_v, nb_of_formulas, r);
 	return; // --------------------------------
 
