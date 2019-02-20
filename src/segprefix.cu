@@ -76,6 +76,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 			if(fc.l[branch_id] == 0) {
 				if(lane_id == 0) {
 					*valid = 0;
+					// printf("[1] oh no! invalid formula %d\n", warp_id);
 				}
 
 				return;
@@ -84,7 +85,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 		if(!fc_found) {
 			if(lane_id == 0) {
-				*valid = 0;
+				formula_satisfied = true;
 			}
 
 			return;
@@ -112,6 +113,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 			if(__any_sync(0xffffffffu, i < r ? c_inv(cl) : 0)) { // check
 				if(lane_id == 0) {
 					*valid = 0;
+					// printf("[2] oh no! invalid formula %d\n", warp_id);
 				}
 
 				return;
@@ -475,14 +477,18 @@ void print_formula(clause *formula, int r) {
 	printf("\n");
 }
 
-void print_batch(clause *d_f1, int nb_of_formulas, int r) {
+void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
 	std::vector<clause> storage(nb_of_formulas * r);
+	std::vector<unsigned int> validities(nb_of_formulas);
 	gpuErrchk(cudaMemcpy(storage.data(), d_f1, storage.size() * sizeof(clause), cudaMemcpyDefault));
+	gpuErrchk(cudaMemcpy(validities.data(), d_v, validities.size() * sizeof(unsigned int), cudaMemcpyDefault));
 	printf("-------------------------------- BATCH -------------------------------------\n");
+	printf("Formula is %s\n\n", formula_satisfied ? "satisfied" : "unsatisfied");
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
 		printf("----- FORMULA %d/%d -----\n", i + 1, storage.size());
+		printf("Validity: 0x%08x\n", validities[i]);
 		print_formula(storage.data() + i * r, r);
 	}
 
@@ -524,11 +530,12 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r) {
 	gpuErrchk(cudaMalloc(&d_f2, s * r * sizeof(clause)));
 	gpuErrchk(cudaMalloc(&d_v, s * sizeof(unsigned int)));
 	gpuErrchk(cudaMemcpy(d_f1, storage.data(), r * sizeof(clause), cudaMemcpyDefault));
+	gpuErrchk(cudaMemset(d_v, 0, nb_of_formulas * sizeof(unsigned int)));
 	storage.resize(0);
 
 	// spawns ceil(s/32) warps, each warp generating a singe new formula
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r);
-	print_batch(d_f2, nb_of_formulas, r);
+	print_batch(d_f2, d_v, nb_of_formulas, r);
 	return; // --------------------------------
 
 	// czy powinna zwrocic prawdziwe 's'?
