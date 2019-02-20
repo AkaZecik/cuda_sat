@@ -75,7 +75,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 			if(fc.l[branch_id] == 0) {
 				if(lane_id == 0) {
-					*valid = 0;
+					*valid = 0x80000001u;
 					// printf("[1] oh no! invalid formula %d\n", warp_id);
 				}
 
@@ -112,14 +112,17 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 			if(__any_sync(0xffffffffu, i < r ? c_inv(cl) : 0)) { // check
 				if(lane_id == 0) {
-					*valid = 0;
+					*valid = 0x80000001u; // check
 					// printf("[2] oh no! invalid formula %d\n", warp_id);
 				}
 
 				return;
 			}
 
-			formula[i] = cl;
+			if(i < r) {
+				formula[i] = cl;
+			}
+
 			__syncwarp();
 		}
 	}
@@ -145,9 +148,9 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 	clause fc = formula[0]; // this might be slow, use __shfl_sync()?
 
 	// check
-	if(!(fc.flags & (0x08u << branch_id))) {
+	if(!(fc.flags & (0x08u << branch_id))) { // fc.l[branch_id] == 0
 		if(lane_id == 0) {
-			*valid = 0;
+			*valid = 0x80000001u; // check
 		}
 
 		return;
@@ -175,7 +178,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 		// check
 		if(__any_sync(0xffffffffu, c_inv(cl))) {
 			if(lane_id == 0) {
-				*valid = 0;
+				*valid = 0x80000001u; // check
 			}
 
 			return;
@@ -220,7 +223,7 @@ __global__ void scan_1d(unsigned int *d_v, int k, int range_parts, int range) {
 	__syncthreads();
 
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		unsigned int v = warp_scan(d_v[tid]);
+		unsigned int v = warp_scan(d_v[tid]); // swap d_v[tid] between 0 and 0x80000001u
 
 		if(lane_id == 31) {
 			partials[warp_id + 1] = v;
