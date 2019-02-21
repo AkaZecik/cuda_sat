@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include <algorithm>
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -10,7 +11,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
-#define BATCH_SIZE 1024
+#define BATCH_SIZE 27
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -629,6 +630,7 @@ int main() {
 	}
 
 	std::vector<clause> formulas(BATCH_SIZE * r);
+	std::vector<int> freq(n, 0);
 
 	for(int i = 0; i < r; ++i) {
 		int j = 0;
@@ -643,8 +645,10 @@ int main() {
 
 			if(var > 0) {
 				formulas[i].l[j] = (int8_t) var;
+				++freq[var];
 			} else {
 				formulas[i].l[j] = (int8_t) -var | 0x80u;
+				++freq[-var];
 			}
 
 			++j;
@@ -655,6 +659,13 @@ int main() {
 			++j;
 		}
 	}
+
+	std::sort(formulas.begin(), formulas.begin() + r,
+			[&freq](clause &a, clause &b) -> bool {
+			int sum1 = abs8(a.l[0]) + abs8(a.l[1]) + abs8(a.l[2]);
+			int sum2 = abs8(b.l[0]) + abs8(b.l[1]) + abs8(b.l[2]);
+			return sum1 > sum2;
+			});
 
 	print_formula(formulas.data(), r);
 	pipeline(formulas, n, r, s, log3r);
