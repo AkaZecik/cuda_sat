@@ -285,6 +285,10 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 		}
 	}
 
+	if((tid & 1023) == 1023) {
+		d_p[blockIdx.x] = prev;
+	}
+
 	/*
 	if((tid & 1023) == 1023) {
 		d_p[blockIdx.x] = prev;
@@ -357,11 +361,14 @@ __global__ void scatter_1d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 /*************************** SCAN_2D *****************************/
 
+/* If id is the number of a position, then it adds all elements
+ * from 0 to id%r positions behind
+ */
 __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int lane_id) {
 	for(int i = 1; i < 32; i <<= 1) {
 		int _v = __shfl_up_sync(0xffffffffu, v, i);
 
-		if(lane_id >= i && i <= reminder) { // check, should be < or <=?
+		if(lane_id >= i && i <= reminder) {
 			v += abs32(_v);
 		}
 	}
@@ -372,10 +379,10 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int l
 __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range_parts, int range) {
 	__shared__ int partials[33];
 	__shared__ int prev;
-	int tid = blockIdx.x * range + threadIdx.x;
+	int range_start = blockIdx.x * range; // check
+	int tid = range_start + threadIdx.x; // check
 	int warp_id = threadIdx.x >> 5;
 	int lane_id = threadIdx.x & 31;
-	int range_start = tid;
 	int remainder = tid % r;
 	int rem_inc = 1024 % r; // check
 
@@ -386,9 +393,9 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+	for(int i = 0; i < range_parts && tid < k; tid += 1024, range_start += 1024) {
 		clause cl = d_f2[tid];
-		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u;
+		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u; // chyba tylko 0 lub 1 wystarczy
 		unsigned int v = warp_scan(satisfied, remainder, lane_id);
 
 		if(lane_id == 31) {
@@ -403,7 +410,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range
 
 		__syncthreads();
 
-		if(tid - range_start < remainder) { // check, < or <=?
+		if(tid - range_start < remainder) { // chyba <
 			d_v[tid] = v + prev;
 		}
 
@@ -420,6 +427,11 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range
 		}
 	}
 
+	if((tid & 1023) == 1023) {
+		d_p[blockIdx.x] = prev;
+	}
+
+	/*
 	if((tid & 1023) == 1023) { // check?
 		d_p[blockIdx.x] = prev;
 		__threadfence();
@@ -429,50 +441,74 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range
 			d_p[lane_id] = warp_scan(d_p[lane_id]);
 		}
 	}
+	*/
+}
+
+__global__ void small_scan_2d(int range, int r) {
+	int lane_id = threadIdx.x & 31;
+	unsigned int v = d_p[lane_id];
+
+	for(int i = 1; i < 32; i <<= 1) {
+		int _v = __shfl_up_sync(0xffffffffu, v, i);
+
+		if(lane_id >= i && i * range <= (range * (lane_id + 1)) % r) {
+			v += abs32(_v);
+		}
+	}
+
+	d_p[lane_id] = v;
 }
 
 __global__ void propagate_2d(unsigned int *d_v, int b, int r, int range_parts, int range) {
-	// ogarnij co z tym 'b'
 	__shared__ int prev;
-	int tid = (blockIdx.x + 1) * range + threadIdx.x;
-	int range_start = tid;
+	int range_start = (blockIdx.x + 1) * range;
+	int tid = range_start + threadIdx.x;
 	int remainder = tid % r;
-	int rem_inc = 1024 % r; // wyniesc poza funkcje?
+	int rem_inc = 1024 % r;
 
 	if(threadIdx.x == 0) {
-		prev = d_p[blockIdx.x];
+		prev = abs32(d_p[blockIdx.x]);
 	}
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
-		if(tid - range_start >= remainder) { // check
-			return;
-		}
-
+	for(int i = 0; i < range_parts && tid < b && tid - range_start < remainder; tid += 1024) {
 		d_v[tid] += prev;
 		remainder += rem_inc;
 
 		if(remainder >= r) {
 			remainder -= r;
 		}
-		// was empty line here?!?!
 	}
 }
 
 /************************** SCATTER_2D ***************************/
 
-__global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r) {
+__global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int b) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
+
+	if(warp_id >= b) {
+		return;
+	}
+
+	int lane_id = threadIdx.x & 31;
 	int shift = warp_id * r;
-	unsigned int *position = d_v + shift;
+	unsigned int *pos = d_v + shift;
 	clause *formula = d_f2 + shift;
 	clause *destination = d_f1 + shift;
+	int nb_not_null;
+
+	if(lane_id == 0) {
+		nb_not_null = abs32(pos[r - 1]);
+	}
+
+	nb_not_null = __shfl_sync(0xffffffffu, nb_not_null, 0);
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
-		int p = position[i]; // check! abs32
-		unsigned int satisfied = p & 0x80000000u; // check!
-		destination[satisfied ? p - 1 : nb_of_valid + warp_id - p] = formula[i];
+		unsigned int value = pos[i];
+		bool not_null = value & 0x80000000u;
+		int new_pos = not_null ? abs32(value) - 1 : nb_not_null + i - abs32(value);
+		destination[new_pos] = formula[i];
 	}
 }
 
@@ -654,13 +690,15 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		range = range_parts * 1024;
 		blocks = (s + range - 1) / range;
 
+		//////// CHECK ARGUMENTS!
 		scan_2d<<<blocks, 1024>>>(d_f1, d_v, nb_of_formulas, r * nb_of_formulas, range_parts, range); // check
 
 		if(blocks > 1) {
+			small_scan_2d<<<1, 32>>>(range, r);
 			propagate_2d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, r, range_parts, range); // check order
 		}
 
-		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r);
+		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 		swap(storage, d_f1, d_f2, nb_of_formulas, s, r);
 		sat_kernel<<<(nb_of_formulas + 31) / 32, 32 * WARPS_NB>>>(d_f1, d_f2, d_v, nb_of_formulas, r);
 		// czy nie blokujemy?
