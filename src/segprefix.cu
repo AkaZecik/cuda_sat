@@ -546,7 +546,7 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	gpuErrchk(cudaMemcpy(storage.data(), d_f1, storage.size() * sizeof(clause), cudaMemcpyDefault));
 	gpuErrchk(cudaMemcpy(validities.data(), d_v, validities.size() * sizeof(unsigned int), cudaMemcpyDefault));
 	printf("-------------------------------- BATCH -------------------------------------\n");
-	printf("Formula is %s\n\n", formula_satisfied ? "satisfied" : "unsatisfied");
+	printf("Formula is %s\n\n", formula_satisfied != -1 ? "satisfied" : "unsatisfied");
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
 		printf("----- FORMULA %d/%d -----\n", i + 1, nb_of_formulas);
