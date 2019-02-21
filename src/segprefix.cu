@@ -151,7 +151,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
  * r - total number of clauses
  */
 __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b, int r) {
-	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5); // CHECK! czy nie? tu jest OK?
+	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 
 	if(warp_id >= b) { // check
 		return;
@@ -174,57 +174,54 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 	}
 
 	bool satisfied = true; // CHECK
+	bool work;
 
-	for(int i = lane_id; i < r; i += 32) { // CHECK IF SATISFIED!
-		clause cl = formula[i];
+	// moze da sie pozbyc ten warunek !c_sat(cl) poprzez wymiane informacji
+	// pod koniec funkcji. W sensie jak napotkamy c_sat(cl) i nasza zmienna
+	// satisfied jest ustawiona na true, to wymieniamy sie tym info
+	// i ktos ustawia zmienna globalna
+	for(int i = lane_id; __any_sync(0xffffffffu, work = (i < r && !c_sat(cl))); i += 32) {
+		clause cl;
 
-		if(c_sat(cl)) { // sprawdzic czy jest dobrze: jak jest nullowalna, to uciekaj
-			return; // perhaps store the 'satisfied' value?
-		}
+		if(work) {
+			clause cl = formula[i];
 
-		for(int l = 0; l < 3; ++l) {
-			for(int x = 0; x < branch_id; ++x) {
-				if(abs8(cl.l[l]) == abs8(fc.l[x])) { // CHECK!!!!!!!!!!!!!!!!!!!!!
-					bool fc_neg = fc.l[x] & 0x80u;
+			for(int l = 0; l < 3; ++l) {
+				for(int x = 0; x < branch_id; ++x) {
+					if(abs8(cl.l[l]) == abs8(fc.l[x])) { // CHECK!!!!!!!!!!!!!!!!!!!!!
+						bool fc_neg = fc.l[x] & 0x80u;
+						bool cl_neg = cl.l[l] & 0x80u;
+						cl.flags |= (0x09u - (fc_neg == cl_neg)) << l;
+					}
+				}
+
+				if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
+					bool fc_neg = fc.l[branch_id] & 0x80u;
 					bool cl_neg = cl.l[l] & 0x80u;
-					cl.flags |= (0x09u - (fc_neg == cl_neg)) << l;
+					cl.flags |= (0x08u + (fc_neg == cl_neg)) << l;
 				}
 			}
 
-			if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
-				bool fc_neg = fc.l[branch_id] & 0x80u;
-				bool cl_neg = cl.l[l] & 0x80u;
-				cl.flags |= (0x08u + (fc_neg == cl_neg)) << l;
+			if(!c_sat(cl)) {
+				satisfied = false;
 			}
 		}
 
-		/*
-		for(int l = 0; l < 3; ++l) {
-			for(int x = 0; x < branch_id; ++x) {
-				if(!(cl.flags & (0x08u << l)) && abs8(cl.l[l]) == abs8(fc.l[x])) {
-					cl.flags |= (0x08u + ((fc.l[x] & 0x80u) == 0x80u)) << l;
-				}
-			}
-
-			if(abs8(cl.l[l]) == abs8(fc.l[branch_id])) {
-				cl.flags |= (0x08u + ((fc.l[branch_id] & 0x80u) == 0)) << l;
-			}
-		}
-		*/
-
-		if(__any_sync(0xffffffffu, c_inv(cl))) { // chyba ok, czy poprawic? petla jest i < r
+		if(__any_sync(0xffffffffu, work ? c_inv(cl) : 0)) { // check
 			if(lane_id == 0) {
-				*valid = 1; // check
+				*valid = 1;
 			}
 
 			return;
 		}
 
-		if(!c_sat(cl)) {
-			satisfied = false; // welp... communicate!
-		}
-
 		destination[i] = cl;
+	}
+
+	if(__all_sync(0xffffffffu, satisfied)) {
+		if(lane_id == 0) {
+			formula_satisfied = warp_id;
+		}
 	}
 }
 
@@ -286,6 +283,7 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 		}
 	}
 
+	/*
 	if((tid & 1023) == 1023) {
 		d_p[blockIdx.x] = prev;
 		__threadfence();
@@ -296,6 +294,12 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 			d_p[lane_id] = warp_scan(d_p[lane_id]);
 		}
 	}
+	*/
+}
+
+__global__ void small_scan_1d() {
+	int lane_id = threadIdx.x & 31;
+	d_p[lane_id] = warp_scan(d_p[lane_id]);
 }
 
 __global__ void propagate_1d(unsigned int *d_v, int b, int range_parts, int range) {
@@ -416,8 +420,8 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range
 	}
 }
 
-__global__ void propagate_2d(unsigned int *d_v, int k, int r, int range_parts, int range) {
-	// ogarnij co z tym 'k'
+__global__ void propagate_2d(unsigned int *d_v, int b, int r, int range_parts, int range) {
+	// ogarnij co z tym 'b'
 	__shared__ int prev;
 	int tid = (blockIdx.x + 1) * range + threadIdx.x;
 	int range_start = tid;
@@ -430,7 +434,7 @@ __global__ void propagate_2d(unsigned int *d_v, int k, int r, int range_parts, i
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
 		if(tid - range_start >= remainder) { // check
 			return;
 		}
@@ -451,11 +455,11 @@ __global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r)
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
 	int shift = warp_id * r;
 	unsigned int *position = d_v + shift;
-	clause *formula = d_f1 + shift;
-	clause *destination = d_f2 + shift;
+	clause *formula = d_f2 + shift;
+	clause *destination = d_f1 + shift;
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
-		int p = position[i]; // check!
+		int p = position[i]; // check! abs32
 		unsigned int satisfied = p & 0x80000000u; // check!
 		destination[satisfied ? p - 1 : nb_of_valid + warp_id - p] = formula[i];
 	}
@@ -598,6 +602,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		scan_1d<<<blocks, 1024>>>(d_v, s, range_parts, range);
 
 		if(blocks > 1) {
+			small_scan_1d<<<1, 32>>>();
 			propagate_1d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, range_parts, range); //check
 		}
 
@@ -605,6 +610,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		gpuErrchk(cudaDeviceSynchronize());
 
 		print_batch(d_f2, d_v, nb_of_formulas, r); //
+		return;
 
 		nb_of_formulas = nb_of_valid;
 		printf("nb_of_formulas: %d\n", nb_of_formulas); //
@@ -687,3 +693,6 @@ int main() {
 
 // TODO: generalize 1024 to blockDim.x
 // TODO: change name of variable 'valid' to 'invalid'
+// TODO: extract the function that assigns a clause based on another clause/values
+// TODO: 1d scan: remove separate summation by making some iffs and letting all threads come across the __syncthreads()
+// TODO: 1d ccan works only because range is divisible by 1024
