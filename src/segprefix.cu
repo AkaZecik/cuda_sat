@@ -40,7 +40,7 @@ struct clause {
 #define c_has(c) (!c_sat(c) && !c_inv(c))
 };
 
-__managed__ bool formula_satisfied = false; // consider making a position of a satisfied formula
+__managed__ int formula_satisfied = -1; // consider making a position of a satisfied formula
 
 /************************* PREPROCESS ****************************/
 
@@ -95,7 +95,7 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 		if(!fc_found) {
 			if(lane_id == 0) {
-				formula_satisfied = true;
+				atomicExch(&formula_satisfied, warp_id); // check
 			}
 
 			return;
@@ -150,14 +150,19 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
  * k - number of formulas to triple
  * r - total number of clauses
  */
-__global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k, int r) {
-	int lane_id = threadIdx.x & 31;
+__global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b, int r) {
 	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5); // CHECK! czy nie? tu jest OK?
+
+	if(warp_id >= b) { // check
+		return;
+	}
+
+	int lane_id = threadIdx.x & 31;
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
-	unsigned int *valid = d_v + k * branch_id + formula_id;
+	unsigned int *valid = d_v + b * branch_id + formula_id;
 	clause *formula = d_f1 + formula_id * r;
-	clause *destination = d_f2 + (branch_id * k + formula_id) * r;
+	clause *destination = d_f2 + (branch_id * b + formula_id) * r;
 	clause fc = formula[0]; // this might be slow, use __shfl_sync()?
 
 	if(fc.flags & (0x08u << branch_id)) { // CHECK!!!!!!!!!!!!!!
@@ -168,11 +173,13 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 		return;
 	}
 
-	for(int i = lane_id; i < r; i += 32) {
+	bool satisfied = true; // CHECK
+
+	for(int i = lane_id; i < r; i += 32) { // CHECK IF SATISFIED!
 		clause cl = formula[i];
 
 		if(c_sat(cl)) { // sprawdzic czy jest dobrze: jak jest nullowalna, to uciekaj
-			return;
+			return; // perhaps store the 'satisfied' value?
 		}
 
 		for(int l = 0; l < 3; ++l) {
@@ -213,6 +220,10 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 			return;
 		}
 
+		if(!c_sat(cl)) {
+			satisfied = false; // welp... communicate!
+		}
+
 		destination[i] = cl;
 	}
 }
@@ -221,7 +232,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int k,
 
 __device__ unsigned int id = 0;
 __device__ unsigned int d_p[32];
-__managed__ unsigned int nb_of_valid;
+__managed__ int nb_of_valid;
 
 __inline__ __device__ unsigned int warp_scan(unsigned int v) {
 	int lane_id = threadIdx.x & 31;
@@ -237,7 +248,7 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v) {
 	return v;
 }
 
-__global__ void scan_1d(unsigned int *d_v, int k, int range_parts, int range) {
+__global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 	__shared__ unsigned int partials[33];
 	__shared__ unsigned int prev;
 	int tid = blockIdx.x * range + threadIdx.x;
@@ -251,8 +262,8 @@ __global__ void scan_1d(unsigned int *d_v, int k, int range_parts, int range) {
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		unsigned int v = warp_scan(d_v[tid] ? 0 : 0x80000001u); // check
+	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
+		unsigned int v = warp_scan(d_v[tid] ? 0 : 0x80000001u);
 
 		if(lane_id == 31) {
 			partials[warp_id + 1] = v;
@@ -287,35 +298,42 @@ __global__ void scan_1d(unsigned int *d_v, int k, int range_parts, int range) {
 	}
 }
 
-__global__ void propagate_1d(unsigned int *d_v, int k, int range_parts, int range) {
+__global__ void propagate_1d(unsigned int *d_v, int b, int range_parts, int range) {
 	__shared__ int prev;
 	int tid = (blockIdx.x + 1) * range + threadIdx.x;
 
 	if(threadIdx.x == 0) {
-		prev = d_p[blockIdx.x];
+		prev = abs32(d_p[blockIdx.x]); // check
 	}
 
 	__syncthreads();
 
 	unsigned int v;
 
-	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
+	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
 		v = d_v[tid] += prev;
 	}
 
-	if(tid == k + 1023) {
+	if(tid == b + 1023) {
 		nb_of_valid = v;
 	}
 }
 
 /************************** SCATTER_1D ***************************/
 
-__global__ void scatter_1d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r) {
+__global__ void scatter_1d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int b) {
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
-	unsigned int p = d_v[warp_id];
-	unsigned int valid = p & 0x80000000u;
-	clause *formula = d_f2 + warp_id * r;
-	clause *destination = d_f1 + (valid ? abs32(p) - 1 : nb_of_valid + warp_id - abs32(p)) * r;
+
+	if(warp_id >= b) {
+		return;
+	}
+
+	// byc moze chcesz wczytac nb_of_valid?
+	unsigned int value = d_v[warp_id];
+	int pos = abs32(value);
+	bool valid = p & 0x80000000u;
+	clause *formula = d_f1 + warp_id * r;
+	clause *destination = d_f2 + (valid ? pos - 1 : nb_of_valid + warp_id - pos) * r;
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
 		destination[i] = formula[i];
@@ -336,7 +354,7 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int l
 	return v;
 }
 
-__global__ void scan_2d(clause *d_f1, unsigned int *d_v, int k, int r, int range_parts, int range) {
+__global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range_parts, int range) {
 	__shared__ int partials[33];
 	__shared__ int prev;
 	int tid = blockIdx.x * range + threadIdx.x;
@@ -354,7 +372,7 @@ __global__ void scan_2d(clause *d_f1, unsigned int *d_v, int k, int r, int range
 	__syncthreads();
 
 	for(int i = 0; i < range_parts && tid < k; tid += 1024) {
-		clause cl = d_f1[tid];
+		clause cl = d_f2[tid];
 		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u;
 		unsigned int v = warp_scan(satisfied, remainder, lane_id);
 
@@ -423,7 +441,7 @@ __global__ void propagate_2d(unsigned int *d_v, int k, int r, int range_parts, i
 		if(remainder >= r) {
 			remainder -= r;
 		}
-
+		// was empty line here?!?!
 	}
 }
 
@@ -447,16 +465,13 @@ __global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r)
 
 // from a formula, extracts variables
 
-void extract_vars(clause *formula, int r, std::vector<bool> &assignment) {
+void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n) {
 	for(int i = 0; i < r; ++i) {
 		for(int j = 0; j < 3; ++j) {
-			int8_t var = formula[i].l[j];
-			bool val = formula[i].flags & (0x01u << j);
-			bool set = formula[i].flags & (0x08u << j);
-
-			if(set) {
-				assignment[abs8(var)] = (var < 0) ^ val; 
-			}
+			uint8_t var = formula[i].l[j];
+			bool sign = ((var & 0x80u) >> 7);
+			bool value = (formula[i].flags & (0x01u << j)) >> j;
+			assignments[abs8(var) - 1] = sign ^ value; 
 		}
 	}
 }
@@ -539,9 +554,7 @@ void swap(std::vector<clause> &storage, clause *d_f1, clause *d_f2, int nb_of_fo
 		clause *src = d_f1 + nb_of_formulas * r - transfer;
 		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
 		nb_of_formulas -= surplus;
-	}
-
-	if(surplus < 0) {
+	} else if(surplus < 0) {
 		int transfer = -surplus * r;
 		clause *dst = d_f1 + nb_of_formulas * r;
 		clause *src = storage.data() + storage.size() - transfer;
@@ -553,7 +566,7 @@ void swap(std::vector<clause> &storage, clause *d_f1, clause *d_f2, int nb_of_fo
 
 /************************** PIPELINE *****************************/
 
-void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r) {
+void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
 	int nb_of_formulas = s;
 	clause *d_f1;
 	clause *d_f2;
@@ -565,20 +578,17 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r) {
 	gpuErrchk(cudaMemset(d_v, 0, nb_of_formulas * sizeof(unsigned int)));
 	storage.resize(0);
 
-	// spawns ceil(s/32) warps, each warp generating a singe new formula
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
-	print_batch(d_f2, d_v, nb_of_formulas, r);
-	return; // --------------------------------
-
-	// czy powinna zwrocic prawdziwe 's'?
+	//print_batch(d_f2, d_v, nb_of_formulas, r);
 
 	while(nb_of_formulas) { // check
 		std::swap(d_f1, d_f2);
 		// jak ma sie to blokowanie do warunku w while-u?
 		gpuErrchk(cudaDeviceSynchronize());
 
-		if(formula_satisfied) {
-			// DO SOMETHING
+		if(formula_satisfied != -1) {
+			gpuErrchk(cudaMemcpy(storage.data(), d_f1 + formula_satisfied * r, r * sizeof(clause), cudaMemcpyDefault));
+			extract_vars(storage.data(), r, assignments, n);
 			return;
 		}
 
@@ -594,7 +604,10 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r) {
 		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r);
 		gpuErrchk(cudaDeviceSynchronize());
 
+		print_batch(d_f2, d_v, nb_of_formulas, r); //
+
 		nb_of_formulas = nb_of_valid;
+		printf("nb_of_formulas: %d\n", nb_of_formulas); //
 		range_parts = (r * nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		range = range_parts * 1024;
 		blocks = (s + range - 1) / range;
@@ -673,3 +686,4 @@ int main() {
 }
 
 // TODO: generalize 1024 to blockDim.x
+// TODO: change name of variable 'valid' to 'invalid'
