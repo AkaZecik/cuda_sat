@@ -376,7 +376,7 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int l
 	return v;
 }
 
-__global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range_parts, int range) {
+__global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range_parts, int range) {
 	__shared__ int partials[33];
 	__shared__ int prev;
 	int range_start = blockIdx.x * range; // check
@@ -393,7 +393,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int k, int r, int range
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < k; tid += 1024, range_start += 1024) {
+	for(int i = 0; i < range_parts && tid < b; tid += 1024, range_start += 1024) {
 		clause cl = d_f2[tid];
 		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u; // chyba tylko 0 lub 1 wystarczy
 		unsigned int v = warp_scan(satisfied, remainder, lane_id);
@@ -595,7 +595,7 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 
 /**************************** SWAP *******************************/
 
-void swap(std::vector<clause> &storage, clause *d_f1, clause *d_f2, int nb_of_formulas, int s, int r) {
+void swap(std::vector<clause> &storage, clause *d_f1, int nb_of_formulas, int s, int r) {
 	int surplus = nb_of_formulas - s/3;
 
 	if(surplus > 0) {
@@ -646,6 +646,8 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		}
 
 		////////
+		gpuErrchk(cudaDeviceSynchronize());
+		printf("================== 0 ======================\n");
 		std::vector<unsigned int> values(nb_of_formulas);
 		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
 		for(int w = 0; w < nb_of_formulas; ++w) {
@@ -657,7 +659,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 
 		int range_parts = (nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		int range = range_parts * 1024;
-		int blocks = (s + range - 1) / range;
+		int blocks = (nb_of_formulas + range - 1) / range;
 		printf("range_parts: %d\n", range_parts); //
 		printf("range: %d\n", range); //
 		printf("blocks: %d\n", blocks); //
@@ -673,6 +675,8 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		gpuErrchk(cudaDeviceSynchronize());
 
 		////////
+		gpuErrchk(cudaDeviceSynchronize());
+		printf("================== 1 ======================\n");
 		values = std::vector<unsigned int>(nb_of_formulas);
 		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
 		for(int w = 0; w < nb_of_formulas; ++w) {
@@ -688,21 +692,37 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		return; //
 		range_parts = (r * nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		range = range_parts * 1024;
-		blocks = (s + range - 1) / range;
+		blocks = (r * nb_of_formulas + range - 1) / range;
 
 		//////// CHECK ARGUMENTS!
-		scan_2d<<<blocks, 1024>>>(d_f1, d_v, nb_of_formulas, r * nb_of_formulas, range_parts, range); // check
+		scan_2d<<<blocks, 1024>>>(d_f2, d_v, r * nb_of_formulas, r, range_parts, range); // check
 
 		if(blocks > 1) {
 			small_scan_2d<<<1, 32>>>(range, r);
-			propagate_2d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, r, range_parts, range); // check order
+			propagate_2d<<<blocks - 1, 1024>>>(d_v, r * nb_of_formulas, r, range_parts, range);
 		}
 
 		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
-		swap(storage, d_f1, d_f2, nb_of_formulas, s, r);
-		sat_kernel<<<(nb_of_formulas + 31) / 32, 32 * WARPS_NB>>>(d_f1, d_f2, d_v, nb_of_formulas, r);
+
+		////////
+		gpuErrchk(cudaDeviceSynchronize());
+		printf("================== 2 ======================\n");
+		values = std::vector<unsigned int>(nb_of_formulas);
+		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
+		for(int w = 0; w < nb_of_formulas; ++w) {
+			printf("%d: %d-%d\n", w, !!(values[w] & 0x80000000u), abs32(values[w]));
+		}
+		printf("\n");
+		gpuErrchk(cudaDeviceSynchronize());
+		////////
+
+		gpuErrchk(cudaDeviceSynchronize());
+		swap(storage, d_f1, nb_of_formulas, s, r);
+
 		// czy nie blokujemy?
-		// cudaMemset...
+		//gpuErrchk(cudaMemset(d_v, 0, 3 * nb_of_formulas * sizeof(unsigned int))); // CHECK!!!
+
+		// sat_kernel<<<(nb_of_formulas + 31) / 32, 32 * WARPS_NB>>>(d_f1, d_f2, d_v, nb_of_formulas, r); // CHECK CHECK CHECK
 	}
 
 	cudaFree(d_f1);
