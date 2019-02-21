@@ -365,11 +365,11 @@ __global__ void scatter_1d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 /* If id is the number of a position, then it adds all elements
  * from 0 to id%r positions behind
  */
-__inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int lane_id) {
+__inline__ __device__ unsigned int warp_scan(unsigned int v, int lane_id, int rem, int scale) {
 	for(int i = 1; i < 32; i <<= 1) {
 		int _v = __shfl_up_sync(0xffffffffu, v, i);
 
-		if(lane_id >= i && i <= reminder) {
+		if(lane_id >= i && i * scale <= rem) {
 			v += abs32(_v);
 		}
 	}
@@ -407,7 +407,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 	for(int i = 0; i < range_parts && tid < b; ++i, tid += 1024, range_start += 1024) {
 		clause cl = d_f2[tid];
 		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u; // chyba tylko 0 lub 1 wystarczy
-		unsigned int v = warp_scan(satisfied, remainder, lane_id);
+		unsigned int v = warp_scan(satisfied, lane_id, remainder, 1);
 
 		if(lane_id == 31) {
 			partials[warp_id + 1] = v;
@@ -416,21 +416,8 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 		__syncthreads();
 
 		if(warp_id == 0) {
-			if(blockIdx.x == 1 && lane_id == 0) {
-				helper_print_partials(partials);
-			}
-
-			int t = partials[lane_id];
-
-			for(int u = 1; u < 32; u <<= 1) {
-				int _t = __shfl_up_sync(0xffffffffu, t, u);
-
-				if(lane_id >= u && u*32 <= (range_start + 32 * lane_id) % r) {
-					t += abs32(_t);
-				}
-			}
-
-			partials[lane_id] = abs32(t);
+			int rem2 = (range_start + 32 * lane_id) % r;
+			partials[lane_id] = warp_scan(partials[lane_id], lane_id, rem2, 32);
 		}
 
 		__syncthreads();
@@ -439,7 +426,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 			v += abs32(partials[warp_id]);
 		}
 
-		if(tid - range_start < remainder) { // chyba <
+		if(tid - range_start < remainder) {
 			v += abs32(prev);
 		}
 
@@ -465,17 +452,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 
 __global__ void small_scan_2d(int range, int r) {
 	int lane_id = threadIdx.x & 31;
-	unsigned int v = d_p[lane_id];
-
-	for(int i = 1; i < 32; i <<= 1) {
-		int _v = __shfl_up_sync(0xffffffffu, v, i);
-
-		if(lane_id >= i && i * range <= (range * (lane_id + 1)) % r) {
-			v += abs32(_v);
-		}
-	}
-
-	d_p[lane_id] = v;
+	d_p[lane_id] = warp_scan(d_p[lane_id], lane_id, (range * (lane_id + 1)) % r, range);
 }
 
 __global__ void propagate_2d(unsigned int *d_v, int b, int r, int range_parts, int range) {
@@ -551,14 +528,14 @@ void print_formula(clause *formula, int r) {
 		uint8_t *ptr = (uint8_t *) &formula[i];
 
 		/*
-		for(int j = 0; j < 4; ++j) {
-			for(int k = 0; k < 8; ++k) {
-				printf("%d", (ptr[j] >> 7-k) & 1);
-			}
+		   for(int j = 0; j < 4; ++j) {
+		   for(int k = 0; k < 8; ++k) {
+		   printf("%d", (ptr[j] >> 7-k) & 1);
+		   }
 
-			printf(" ");
-		}
-		*/
+		   printf(" ");
+		   }
+		 */
 
 		printf("\t");
 
