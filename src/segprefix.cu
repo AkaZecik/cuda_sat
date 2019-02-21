@@ -254,14 +254,14 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 	int warp_id = threadIdx.x >> 5;
 	int lane_id = threadIdx.x & 31;
 
-	if(tid == 0) {
+	if(threadIdx.x == 0) {
 		partials[0] = 0;
 		prev = 0;
 	}
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
+	for(int i = 0; i < range_parts && tid < b; ++i, tid += 1024) {
 		unsigned int v = warp_scan(d_v[tid] ? 0 : 0x80000001u);
 
 		if(lane_id == 31) {
@@ -276,7 +276,8 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 
 		__syncthreads();
 
-		d_v[tid] = v + prev;
+		// DO JASNEJ CHOLERY, DODAJ PARTIALE!!! a teraz checkuj to!
+		d_v[tid] = v + partials[warp_id] + prev;
 
 		__syncthreads();
 
@@ -376,6 +377,16 @@ __inline__ __device__ unsigned int warp_scan(unsigned int v, int reminder, int l
 	return v;
 }
 
+__device__ void helper_print_partials(int *partials) {
+	printf("Printing partials from (blockIdx.x: %d, threadIdx.x: %d)\n", blockIdx.x, threadIdx.x);
+
+	for(int i = 0; i < 32; ++i) {
+		printf("partials[%d]: %d\n", i, partials[i]);
+	}
+
+	printf("\n");
+}
+
 __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range_parts, int range) {
 	__shared__ int partials[33];
 	__shared__ int prev;
@@ -386,14 +397,14 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 	int remainder = tid % r;
 	int rem_inc = 1024 % r; // check
 
-	if(tid == 0) {
+	if(threadIdx.x == 0) {
 		partials[0] = 0;
 		prev = 0;
 	}
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < b; tid += 1024, range_start += 1024) {
+	for(int i = 0; i < range_parts && tid < b; ++i, tid += 1024, range_start += 1024) {
 		clause cl = d_f2[tid];
 		unsigned int satisfied = c_sat(cl) ? 0 : 0x80000001u; // chyba tylko 0 lub 1 wystarczy
 		unsigned int v = warp_scan(satisfied, remainder, lane_id);
@@ -405,14 +416,34 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 		__syncthreads();
 
 		if(warp_id == 0) {
-			partials[lane_id] = warp_scan(partials[lane_id]);
+			if(blockIdx.x == 1 && lane_id == 0) {
+				helper_print_partials(partials);
+			}
+
+			int t = partials[lane_id];
+
+			for(int u = 1; u < 32; u <<= 1) {
+				int _t = __shfl_up_sync(0xffffffffu, t, u);
+
+				if(lane_id >= u && u*32 <= (range_start + 32 * lane_id) % r) {
+					t += abs32(_t);
+				}
+			}
+
+			partials[lane_id] = abs32(t);
 		}
 
 		__syncthreads();
 
-		if(tid - range_start < remainder) { // chyba <
-			d_v[tid] = v + prev;
+		if(tid - range_start - 32 * warp_id < remainder) {
+			v += abs32(partials[warp_id]);
 		}
+
+		if(tid - range_start < remainder) { // chyba <
+			v += abs32(prev);
+		}
+
+		d_v[tid] = v;
 
 		__syncthreads();
 
@@ -422,7 +453,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 
 		remainder += rem_inc;
 
-		if(remainder >= r) { // check
+		if(remainder >= r) {
 			remainder -= r;
 		}
 	}
@@ -430,18 +461,6 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 	if((tid & 1023) == 1023) {
 		d_p[blockIdx.x] = prev;
 	}
-
-	/*
-	if((tid & 1023) == 1023) { // check?
-		d_p[blockIdx.x] = prev;
-		__threadfence();
-
-		if(atomicAdd(&id, 1) == gridDim.x - 1) {
-			id = 0;
-			d_p[lane_id] = warp_scan(d_p[lane_id]);
-		}
-	}
-	*/
 }
 
 __global__ void small_scan_2d(int range, int r) {
@@ -531,6 +550,7 @@ void print_formula(clause *formula, int r) {
 	for(int i = 0; i < r; ++i) {
 		uint8_t *ptr = (uint8_t *) &formula[i];
 
+		/*
 		for(int j = 0; j < 4; ++j) {
 			for(int k = 0; k < 8; ++k) {
 				printf("%d", (ptr[j] >> 7-k) & 1);
@@ -538,6 +558,7 @@ void print_formula(clause *formula, int r) {
 
 			printf(" ");
 		}
+		*/
 
 		printf("\t");
 
@@ -577,20 +598,21 @@ void print_formula(clause *formula, int r) {
 
 void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
+
 	std::vector<clause> storage(nb_of_formulas * r);
 	std::vector<unsigned int> validities(nb_of_formulas);
 	gpuErrchk(cudaMemcpy(storage.data(), d_f1, storage.size() * sizeof(clause), cudaMemcpyDefault));
-	gpuErrchk(cudaMemcpy(validities.data(), d_v, validities.size() * sizeof(unsigned int), cudaMemcpyDefault));
+
 	printf("-------------------------------- BATCH -------------------------------------\n");
 	printf("Formula is %s\n\n", formula_satisfied != -1 ? "satisfied" : "unsatisfied");
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
 		printf("----- FORMULA %d/%d -----\n", i + 1, nb_of_formulas);
-		printf("Validity: %d\n", validities[i]);
 		print_formula(storage.data() + i * r, r);
 	}
 
 	printf("\n");
+	gpuErrchk(cudaDeviceSynchronize());
 }
 
 /**************************** SWAP *******************************/
@@ -615,6 +637,29 @@ void swap(std::vector<clause> &storage, clause *d_f1, int nb_of_formulas, int s,
 	}
 }
 
+void print_d_v(unsigned int *d_v, int b, int r) {
+	gpuErrchk(cudaDeviceSynchronize());
+
+	std::vector<unsigned int> v(b * r);
+	gpuErrchk(cudaMemcpy(v.data(), d_v, b * r * sizeof(unsigned int), cudaMemcpyDefault));
+
+	printf("================ PRINTING d_v ================\n");
+
+	for(int i = 0; i < b; ++i) {
+		for(int j = 0; j < r; ++j) {
+			int id = i * r + j;
+			unsigned int value = v[id];
+			printf("d_v[%d]: %d-%u\n", id, !!(value & 0x80000000u), abs32(value));
+		}
+
+		printf("\n");
+	}
+
+	printf("-----------------\n\n");
+
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
 /************************** PIPELINE *****************************/
 
 void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
@@ -624,15 +669,12 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 	unsigned int *d_v;
 	gpuErrchk(cudaMalloc(&d_f1, s * r * sizeof(clause)));
 	gpuErrchk(cudaMalloc(&d_f2, s * r * sizeof(clause)));
-	gpuErrchk(cudaMalloc(&d_v, s * sizeof(unsigned int)));
+	gpuErrchk(cudaMalloc(&d_v, s * r * sizeof(unsigned int)));
 	gpuErrchk(cudaMemcpy(d_f1, storage.data(), r * sizeof(clause), cudaMemcpyDefault));
 	gpuErrchk(cudaMemset(d_v, 0, nb_of_formulas * sizeof(unsigned int)));
 	storage.resize(0);
 
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
-	print_batch(d_f2, d_v, nb_of_formulas, r); //
-	printf("-----------------------------------------------"); //
-	printf("nb_of_formulas: %d\n", nb_of_formulas);
 
 	while(nb_of_formulas) { // check
 		std::swap(d_f1, d_f2);
@@ -640,29 +682,23 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		gpuErrchk(cudaDeviceSynchronize());
 
 		if(formula_satisfied != -1) {
+			printf("LEAVING THAT HELL!\n");
 			gpuErrchk(cudaMemcpy(storage.data(), d_f1 + formula_satisfied * r, r * sizeof(clause), cudaMemcpyDefault));
 			extract_vars(storage.data(), r, assignments, n);
 			return;
 		}
 
-		////////
-		gpuErrchk(cudaDeviceSynchronize());
-		printf("================== 0 ======================\n");
-		std::vector<unsigned int> values(nb_of_formulas);
-		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
-		for(int w = 0; w < nb_of_formulas; ++w) {
-			printf("%d: %d-%d\n", w, !!(values[w] & 0x80000000u), abs32(values[w]));
-		}
-		printf("\n");
-		gpuErrchk(cudaDeviceSynchronize());
-		////////
-
 		int range_parts = (nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		int range = range_parts * 1024;
 		int blocks = (nb_of_formulas + range - 1) / range;
+
+		printf("SCAN 1D\n"); //
+		printf("nb_of_formulas: %d\n", nb_of_formulas); //
 		printf("range_parts: %d\n", range_parts); //
 		printf("range: %d\n", range); //
 		printf("blocks: %d\n", blocks); //
+		printf("\n"); //
+
 		scan_1d<<<blocks, 1024>>>(d_v, s, range_parts, range);
 
 		if(blocks > 1) {
@@ -674,50 +710,48 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 		gpuErrchk(cudaDeviceSynchronize());
 
-		////////
-		gpuErrchk(cudaDeviceSynchronize());
-		printf("================== 1 ======================\n");
-		values = std::vector<unsigned int>(nb_of_formulas);
-		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
-		for(int w = 0; w < nb_of_formulas; ++w) {
-			printf("%d: %d-%d\n", w, !!(values[w] & 0x80000000u), abs32(values[w]));
-		}
-		printf("\n");
-		////////
-
-
 		nb_of_formulas = nb_of_valid;
-		printf("nb_of_formulas: %d\n", nb_of_formulas); //
-		print_batch(d_f2, d_v, nb_of_formulas, r); //
-		return; //
 		range_parts = (r * nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		range = range_parts * 1024;
 		blocks = (r * nb_of_formulas + range - 1) / range;
 
+		printf("SCAN 2D\n"); //
+		printf("nb_of_formulas: %d\n", nb_of_formulas); //
+		printf("range_parts: %d\n", range_parts); //
+		printf("range: %d\n", range); //
+		printf("blocks: %d\n", blocks); //
+		printf("\n"); //
+
+		//printf("Before scan_2d\n");
+		//print_d_v(d_v, nb_of_formulas, r);
+
 		//////// CHECK ARGUMENTS!
 		scan_2d<<<blocks, 1024>>>(d_f2, d_v, r * nb_of_formulas, r, range_parts, range); // check
+		gpuErrchk(cudaDeviceSynchronize());
+		//printf("After scan_2d\n");
+		//print_d_v(d_v, nb_of_formulas, r);
 
 		if(blocks > 1) {
 			small_scan_2d<<<1, 32>>>(range, r);
+			gpuErrchk(cudaDeviceSynchronize());
+			//printf("After small_scan_2d\n");
+			//print_d_v(d_v, nb_of_formulas, r);
 			propagate_2d<<<blocks - 1, 1024>>>(d_v, r * nb_of_formulas, r, range_parts, range);
+			gpuErrchk(cudaDeviceSynchronize());
+			printf("After propagate_2d\n");
+			print_d_v(d_v, nb_of_formulas, r);
 		}
 
 		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
+		//print_batch(d_f2, d_v, nb_of_formulas, r); //
 
-		////////
-		gpuErrchk(cudaDeviceSynchronize());
-		printf("================== 2 ======================\n");
-		values = std::vector<unsigned int>(nb_of_formulas);
-		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
-		for(int w = 0; w < nb_of_formulas; ++w) {
-			printf("%d: %d-%d\n", w, !!(values[w] & 0x80000000u), abs32(values[w]));
-		}
-		printf("\n");
-		gpuErrchk(cudaDeviceSynchronize());
-		////////
+		//gpuErrchk(cudaDeviceSynchronize());
+		//printf("After scatter_2d\n");
+		//print_d_v(d_v, nb_of_formulas, r);
 
-		gpuErrchk(cudaDeviceSynchronize());
+		gpuErrchk(cudaDeviceSynchronize()); // ma byc?
 		swap(storage, d_f1, nb_of_formulas, s, r);
+		return; // 
 
 		// czy nie blokujemy?
 		//gpuErrchk(cudaMemset(d_v, 0, 3 * nb_of_formulas * sizeof(unsigned int))); // CHECK!!!
@@ -782,7 +816,6 @@ int main() {
 			return sum1 > sum2;
 			});
 
-	print_formula(formulas.data(), r);
 	pipeline(formulas, n, r, s, log3r, assignments);
 }
 
