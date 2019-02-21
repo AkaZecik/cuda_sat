@@ -174,17 +174,12 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 	}
 
 	bool satisfied = true; // CHECK
-	bool work;
 
-	// moze da sie pozbyc ten warunek !c_sat(cl) poprzez wymiane informacji
-	// pod koniec funkcji. W sensie jak napotkamy c_sat(cl) i nasza zmienna
-	// satisfied jest ustawiona na true, to wymieniamy sie tym info
-	// i ktos ustawia zmienna globalna
-	for(int i = lane_id; __any_sync(0xffffffffu, work = (i < r && !c_sat(cl))); i += 32) {
+	for(int i = lane_id; __any_sync(0xffffffffu, i < r); i += 32) {
 		clause cl;
 
-		if(work) {
-			clause cl = formula[i];
+		if(i < r) {
+			cl = formula[i];
 
 			for(int l = 0; l < 3; ++l) {
 				for(int x = 0; x < branch_id; ++x) {
@@ -207,7 +202,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 			}
 		}
 
-		if(__any_sync(0xffffffffu, work ? c_inv(cl) : 0)) { // check
+		if(__any_sync(0xffffffffu, i < r ? c_inv(cl) : 0)) { // check
 			if(lane_id == 0) {
 				*valid = 1;
 			}
@@ -215,7 +210,14 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 			return;
 		}
 
+		if(i < r) {
 		destination[i] = cl;
+		}
+
+		if(__any_sync(0xffffffffu, i < r ? c_sat(cl) : 1)) { // check
+			break;
+		}
+
 	}
 
 	if(__all_sync(0xffffffffu, satisfied)) {
@@ -312,32 +314,41 @@ __global__ void propagate_1d(unsigned int *d_v, int b, int range_parts, int rang
 
 	__syncthreads();
 
-	unsigned int v;
-
 	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
-		v = d_v[tid] += prev;
-	}
-
-	if(tid == b + 1023) {
-		nb_of_valid = v;
+		d_v[tid] += prev;
 	}
 }
 
 /************************** SCATTER_1D ***************************/
 
 __global__ void scatter_1d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r, int b) {
+	// IF INVALID THEN WHY THE HECK YOU SORT THEM!?!?!?!?!
+	__shared__ unsigned int values;
 	int warp_id = (blockIdx.x << 5) + (threadIdx.x >> 5);
 
 	if(warp_id >= b) {
 		return;
 	}
 
-	// byc moze chcesz wczytac nb_of_valid?
+	if(threadIdx.x == 0) {
+		values = abs32(d_v[b - 1]);
+
+		if(blockIdx.x == 0) {
+			nb_of_valid = values;
+		}
+	}
+
+	__syncthreads();
+
 	unsigned int value = d_v[warp_id];
+
+	if(!(value & 0x80000000u)) {
+		return;
+	}
+
 	int pos = abs32(value);
-	bool valid = p & 0x80000000u;
 	clause *formula = d_f1 + warp_id * r;
-	clause *destination = d_f2 + (valid ? pos - 1 : nb_of_valid + warp_id - pos) * r;
+	clause *destination = d_f2 + (pos - 1) * r;
 
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
 		destination[i] = formula[i];
@@ -539,7 +550,7 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
 		printf("----- FORMULA %d/%d -----\n", i + 1, nb_of_formulas);
-		printf("Formula %s\n", validities[i] ? "is invalid" : "may be valid");
+		printf("Validity: %d\n", validities[i]);
 		print_formula(storage.data() + i * r, r);
 	}
 
@@ -583,7 +594,9 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 	storage.resize(0);
 
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
-	//print_batch(d_f2, d_v, nb_of_formulas, r);
+	print_batch(d_f2, d_v, nb_of_formulas, r); //
+	printf("-----------------------------------------------"); //
+	printf("nb_of_formulas: %d\n", nb_of_formulas);
 
 	while(nb_of_formulas) { // check
 		std::swap(d_f1, d_f2);
@@ -596,24 +609,47 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 			return;
 		}
 
+		////////
+		std::vector<unsigned int> values(nb_of_formulas);
+		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
+		for(int w = 0; w < nb_of_formulas; ++w) {
+			printf("%d: %d-%d\n", w, !!(values[w] & 0x80000000u), abs32(values[w]));
+		}
+		printf("\n");
+		gpuErrchk(cudaDeviceSynchronize());
+		////////
+
 		int range_parts = (nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		int range = range_parts * 1024;
 		int blocks = (s + range - 1) / range;
+		printf("range_parts: %d\n", range_parts); //
+		printf("range: %d\n", range); //
+		printf("blocks: %d\n", blocks); //
 		scan_1d<<<blocks, 1024>>>(d_v, s, range_parts, range);
 
 		if(blocks > 1) {
+			printf("blocks > 1\n"); //
 			small_scan_1d<<<1, 32>>>();
 			propagate_1d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, range_parts, range); //check
 		}
 
-		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r);
+		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 		gpuErrchk(cudaDeviceSynchronize());
 
-		print_batch(d_f2, d_v, nb_of_formulas, r); //
-		return;
+		////////
+		values = std::vector<unsigned int>(nb_of_formulas);
+		gpuErrchk(cudaMemcpy(values.data(), d_v, nb_of_formulas * sizeof(unsigned int), cudaMemcpyDefault));
+		for(int w = 0; w < nb_of_formulas; ++w) {
+			printf("%d: %d-%d\n", w, !!(values[w] & 0x80000000u), abs32(values[w]));
+		}
+		printf("\n");
+		////////
+
 
 		nb_of_formulas = nb_of_valid;
 		printf("nb_of_formulas: %d\n", nb_of_formulas); //
+		print_batch(d_f2, d_v, nb_of_formulas, r); //
+		return; //
 		range_parts = (r * nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		range = range_parts * 1024;
 		blocks = (s + range - 1) / range;
@@ -628,6 +664,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		swap(storage, d_f1, d_f2, nb_of_formulas, s, r);
 		sat_kernel<<<(nb_of_formulas + 31) / 32, 32 * WARPS_NB>>>(d_f1, d_f2, d_v, nb_of_formulas, r);
 		// czy nie blokujemy?
+		// cudaMemset...
 	}
 
 	cudaFree(d_f1);
@@ -650,6 +687,7 @@ int main() {
 
 	std::vector<clause> formulas(BATCH_SIZE * r);
 	std::vector<int> freq(n, 0);
+	std::vector<bool> assignments;
 
 	for(int i = 0; i < r; ++i) {
 		int j = 0;
@@ -687,8 +725,7 @@ int main() {
 			});
 
 	print_formula(formulas.data(), r);
-	pipeline(formulas, n, r, s, log3r);
-
+	pipeline(formulas, n, r, s, log3r, assignments);
 }
 
 // TODO: generalize 1024 to blockDim.x
