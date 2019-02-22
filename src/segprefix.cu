@@ -151,9 +151,9 @@ __global__ void preprocess(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
  * r - total number of clauses
  */
 __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b, int r) {
-	int warp_id = WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
+	int warp_id = 3 * WARPS_NB * blockIdx.x + (threadIdx.x >> 5);
 
-	if(warp_id >= b) { // check
+	if(warp_id >= 3 * b) { // check
 		return;
 	}
 
@@ -173,14 +173,19 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 		return;
 	}
 
+	bool ending = false;
 	bool satisfied = true; // CHECK
 
-	for(int i = lane_id; __any_sync(0xffffffffu, i < r); i += 32) {
+	for(int i = lane_id; !ending && __any_sync(0xffffffffu, i < r); i += 32) { // bez sync??
 		clause cl;
 
 		if(i < r) {
 			cl = formula[i];
+		}
 
+		ending = __any_sync(0xffffffffu, i < r ? c_sat(cl) : 1);
+
+		if(i < r) {
 			for(int l = 0; l < 3; ++l) {
 				for(int x = 0; x < branch_id; ++x) {
 					if(abs8(cl.l[l]) == abs8(fc.l[x])) { // CHECK!!!!!!!!!!!!!!!!!!!!!
@@ -211,18 +216,13 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 		}
 
 		if(i < r) {
-		destination[i] = cl;
+			destination[i] = cl;
 		}
-
-		if(__any_sync(0xffffffffu, i < r ? c_sat(cl) : 1)) { // check
-			break;
-		}
-
 	}
 
 	if(__all_sync(0xffffffffu, satisfied)) {
 		if(lane_id == 0) {
-			formula_satisfied = warp_id;
+			formula_satisfied = branch_id * b + formula_id;
 		}
 	}
 }
@@ -276,7 +276,6 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 
 		__syncthreads();
 
-		// DO JASNEJ CHOLERY, DODAJ PARTIALE!!! a teraz checkuj to!
 		d_v[tid] = v + partials[warp_id] + prev;
 
 		__syncthreads();
@@ -289,19 +288,6 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 	if((tid & 1023) == 1023) {
 		d_p[blockIdx.x] = prev;
 	}
-
-	/*
-	if((tid & 1023) == 1023) {
-		d_p[blockIdx.x] = prev;
-		__threadfence();
-
-		// sprawdzic czy to zadziala <3
-		if(atomicAdd(&id, 1) == gridDim.x - 1) {
-			id = 0;
-			d_p[lane_id] = warp_scan(d_p[lane_id]);
-		}
-	}
-	*/
 }
 
 __global__ void small_scan_1d() {
@@ -508,9 +494,7 @@ __global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 	}
 }
 
-/************************ EXTRACT_VARS ***************************/
-
-// from a formula, extracts variables
+/**************************** UTILS ******************************/
 
 void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n) {
 	for(int i = 0; i < r; ++i) {
@@ -592,28 +576,6 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
-/**************************** SWAP *******************************/
-
-void swap(std::vector<clause> &storage, clause *d_f1, int nb_of_formulas, int s, int r) {
-	int surplus = nb_of_formulas - s/3;
-
-	if(surplus > 0) {
-		int transfer = surplus * r;
-		storage.resize(storage.size() + transfer);
-		clause *dst = storage.data() + storage.size() - transfer;
-		clause *src = d_f1 + nb_of_formulas * r - transfer;
-		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
-		nb_of_formulas -= surplus;
-	} else if(surplus < 0) {
-		int transfer = -surplus * r;
-		clause *dst = d_f1 + nb_of_formulas * r;
-		clause *src = storage.data() + storage.size() - transfer;
-		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
-		storage.resize(storage.size() - transfer);
-		nb_of_formulas += -surplus;
-	}
-}
-
 void print_d_v(unsigned int *d_v, int b, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
 
@@ -637,6 +599,30 @@ void print_d_v(unsigned int *d_v, int b, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
+/**************************** SWAP *******************************/
+
+void swap(std::vector<clause> &storage, clause *d_f1, int &nb_of_formulas, int s, int r) {
+	int surplus = nb_of_formulas - s/3;
+
+	if(surplus > 0) {
+		int difference = surplus;
+		int transfer = difference * r;
+		storage.resize(storage.size() + transfer);
+		clause *dst = storage.data() + storage.size() - transfer;
+		clause *src = d_f1 + nb_of_formulas * r - transfer;
+		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
+		nb_of_formulas += difference; // check
+	} else if(surplus < 0) {
+		int difference = std::min(-surplus, storage.size() / r);
+		int transfer = difference * r;
+		clause *dst = d_f1 + nb_of_formulas * r;
+		clause *src = storage.data() + storage.size() - transfer;
+		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
+		storage.resize(storage.size() - transfer);
+		nb_of_formulas -= difference; // check
+	}
+}
+
 /************************** PIPELINE *****************************/
 
 void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
@@ -648,7 +634,7 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 	gpuErrchk(cudaMalloc(&d_f2, s * r * sizeof(clause)));
 	gpuErrchk(cudaMalloc(&d_v, s * r * sizeof(unsigned int)));
 	gpuErrchk(cudaMemcpy(d_f1, storage.data(), r * sizeof(clause), cudaMemcpyDefault));
-	gpuErrchk(cudaMemset(d_v, 0, nb_of_formulas * sizeof(unsigned int)));
+	gpuErrchk(cudaMemset(d_v, 0, s * sizeof(unsigned int)));
 	storage.resize(0);
 
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
@@ -725,26 +711,26 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 
 		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 
-		gpuErrchk(cudaDeviceSynchronize());
-		printf("After scatter_2d\n");
-		print_d_v(d_v, nb_of_formulas, r);
+		//gpuErrchk(cudaDeviceSynchronize());
+		//printf("After scatter_2d\n");
+		//print_d_v(d_v, nb_of_formulas, r);
 
+		gpuErrchk(cudaDeviceSynchronize());
 		printf("Batch after scatter_2d\n");
 		print_batch(d_f1, d_v, nb_of_formulas, r); //
 
-		gpuErrchk(cudaDeviceSynchronize()); // ma byc?
+		gpuErrchk(cudaMemset(d_v, 0, s * sizeof(unsigned int))); // chyba ok
 		swap(storage, d_f1, nb_of_formulas, s, r);
-		return; // 
 
-		// czy nie blokujemy?
-		//gpuErrchk(cudaMemset(d_v, 0, 3 * nb_of_formulas * sizeof(unsigned int))); // CHECK!!!
+		// moze checkowac nb_of_formulas juz teraz? moze sat_kernel nie bedzie sie mogl odpalic?
 
-		// sat_kernel<<<(nb_of_formulas + 31) / 32, 32 * WARPS_NB>>>(d_f1, d_f2, d_v, nb_of_formulas, r); // CHECK CHECK CHECK
+		sat_kernel<<<(nb_of_formulas + WARPS_NB - 1) / WARPS_NB, 3 * WARPS_NB * 32>>>(d_f1, d_f2, d_v, nb_of_formulas, r); // CHECK CHECK CHECK
+		nb_of_formulas *= 3;
 	}
 
-	cudaFree(d_f1);
-	cudaFree(d_f2);
-	cudaFree(d_v);
+	gpuErrchk(cudaFree(d_f1));
+	gpuErrchk(cudaFree(d_f2));
+	gpuErrchk(cudaFree(d_v));
 }
 
 /**************************** MAIN *******************************/
@@ -760,7 +746,8 @@ int main() {
 		++log3r;
 	}
 
-	std::vector<clause> formulas(BATCH_SIZE * r);
+	std::vector<clause> formulas(r);
+	formulas.reserve(2 * s * r);
 	std::vector<int> freq(n, 0);
 	std::vector<bool> assignments;
 
