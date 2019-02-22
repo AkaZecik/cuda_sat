@@ -682,7 +682,7 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 			storage.resize(r);
 			gpuErrchk(cudaMemcpy(storage.data(), d_f1 + formula_satisfied * r, r * sizeof(clause), cudaMemcpyDefault));
 			extract_vars(storage.data(), r, assignments, n);
-			print_formula(storage.data(), r);
+			//print_formula(storage.data(), r);
 			gpuErrchk(cudaFree(d_f1));
 			gpuErrchk(cudaFree(d_f2));
 			gpuErrchk(cudaFree(d_v));
@@ -821,8 +821,26 @@ int main() {
 		for(int i = 1; i <= n; ++i) {
 			printf("%d: %s\n", i, assignments[i] ? "true" : "false");
 		}
+
+		for(int i = 0; i < r; ++i) {
+			for(int j = 0; j < 3; ++j) {
+				uint8_t lit = formula[i].l[j];
+				printf("%d\t", (lit & 0x80u) ? -abs8(lit) : lit);
+			}
+
+			for(int j = 0; j < 3; ++j) {
+				uint8_t lit = formula[i].l[j];
+				bool val = assignments[abs8(lit)] ^ !!(lit & 0x80);
+				printf("%s\t", val ? "true" : "false");
+			}
+
+			printf("\n");
+		}
+
+		exit(0);
 	} else {
 		printf("not satisfied\n");
+		exit(1);
 	}
 }
 
