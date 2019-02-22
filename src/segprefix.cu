@@ -773,7 +773,7 @@ int main() {
 
 	std::vector<clause> formula(r);
 	std::vector<int> freq(n, 0);
-	std::vector<bool> assignments(n);
+	std::vector<bool> assignments(n + 1);
 
 	for(int i = 0; i < r; ++i) {
 		int j = 0;
@@ -813,8 +813,8 @@ int main() {
 	if(pipeline(formula, n, r, s, log3r, assignments)) {
 		printf("satisfied\n");
 
-		for(int i = 0; i < n; ++i) {
-			printf("%d: %s\n", i + 1, assignments[i] ? "true" : "false");
+		for(int i = 1; i <= n; ++i) {
+			printf("%d: %s\n", i, assignments[i] ? "true" : "false");
 		}
 	} else {
 		printf("not satisfied\n");
