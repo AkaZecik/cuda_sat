@@ -712,7 +712,7 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 
-		check_d_v(d_v, nb_of_formulas, 1, "After scatter_1d");
+		//check_d_v(d_v, nb_of_formulas, 1, "After scatter_1d");
 		//print_d_v(d_v, nb_of_formulas, 1, "After scatter_1d"); ////////
 
 		gpuErrchk(cudaDeviceSynchronize());
@@ -742,7 +742,7 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 			scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 
-			check_d_v(d_v, nb_of_formulas, r, "After scatter_2");
+			//check_d_v(d_v, nb_of_formulas, r, "After scatter_2");
 			//print_d_v(d_v, nb_of_formulas, r, "After scatter_2d");
 		}
 
