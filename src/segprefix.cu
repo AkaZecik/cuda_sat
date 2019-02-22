@@ -11,7 +11,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
-#define BATCH_SIZE 16384
+#define BATCH_SIZE 243
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -367,7 +367,7 @@ __device__ void helper_print_partials(int *partials) {
 	printf("Printing partials from (blockIdx.x: %d, threadIdx.x: %d)\n", blockIdx.x, threadIdx.x);
 
 	for(int i = 0; i < 32; ++i) {
-		printf("partials[%d]: %d\n", i, partials[i]);
+		printf("partials[%d]: %d-%d\n", i, !!(partials[i] & 0x80000000u), abs32(partials[i]));
 	}
 
 	printf("\n");
@@ -402,7 +402,7 @@ __global__ void scan_2d(clause *d_f2, unsigned int *d_v, int b, int r, int range
 		__syncthreads();
 
 		if(warp_id == 0) {
-			int rem2 = (range_start + 32 * lane_id) % r;
+			int rem2 = (range_start + 32 * lane_id - 1) % r;
 			partials[lane_id] = abs32(warp_scan(partials[lane_id], lane_id, rem2, 32));
 		}
 
@@ -536,13 +536,14 @@ void print_formula(clause *formula, int r) {
 	printf("\n");
 }
 
-void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
+void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r, char const *msg) {
 	gpuErrchk(cudaDeviceSynchronize());
 
 	std::vector<clause> storage(nb_of_formulas * r);
 	gpuErrchk(cudaMemcpy(storage.data(), d_f1, storage.size() * sizeof(clause), cudaMemcpyDefault));
 
 	printf("-------------------------------- BATCH -------------------------------------\n");
+	printf("%s\n", msg);
 	printf("Formula is %s\n\n", formula_satisfied != -1 ? "satisfied" : "unsatisfied");
 
 	for(int i = 0; i < nb_of_formulas; ++i) {
@@ -554,25 +555,60 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
-void print_d_v(unsigned int *d_v, int b, int r) {
+void print_d_v(unsigned int *d_v, int b, int r, char const *msg) {
 	gpuErrchk(cudaDeviceSynchronize());
 
 	std::vector<unsigned int> v(b * r);
 	gpuErrchk(cudaMemcpy(v.data(), d_v, b * r * sizeof(unsigned int), cudaMemcpyDefault));
 
 	printf("================ PRINTING d_v ================\n");
+	printf("%s\n", msg);
 
 	for(int i = 0; i < b; ++i) {
 		for(int j = 0; j < r; ++j) {
 			int id = i * r + j;
 			unsigned int value = v[id];
+
+			if(id % 32 == 0) {
+				printf("---%d\n", id / 32);
+			}
+
 			printf("d_v[%d]: %d-%u\n", id, !!(value & 0x80000000u), abs32(value));
 		}
 
-		printf("\n");
+		if(r != 1) {
+			printf("\n");
+		}
 	}
 
 	printf("-----------------\n\n");
+
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+void check_d_v(unsigned int *d_v, int b, int r, char const *msg) {
+	gpuErrchk(cudaDeviceSynchronize());
+
+	std::vector<unsigned int> storage(b * r);
+	gpuErrchk(cudaMemcpy(storage.data(), d_v, b * r * sizeof(int), cudaMemcpyDefault));
+
+	int sum = 0;
+
+	for(int i = 0; i < storage.size(); ++i) {
+		if(r != 1 && i % r == 0) {
+			sum = 0;
+		}
+
+		sum += !!(storage[i] & 0x80000000u);
+		int val = abs32(storage[i]);
+
+		if(sum != abs32(storage[i])) {
+			printf("%s\n", msg);
+			print_d_v(d_v, b, r, "From the checker");
+			printf(">>> ERROR at position %d! Calculated: %d, read: %d\n", i, sum, val);
+			exit(1);
+		}
+	}
 
 	gpuErrchk(cudaDeviceSynchronize());
 }
@@ -672,7 +708,12 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 			propagate_1d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, range_parts, range);
 		}
 
+
 		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
+
+		check_d_v(d_v, nb_of_formulas, 1, "After scatter_1d");
+		//print_d_v(d_v, nb_of_formulas, 1, "After scatter_1d"); ////////
+
 		gpuErrchk(cudaDeviceSynchronize());
 
 		nb_of_formulas = nb_of_valid;
@@ -700,6 +741,8 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 			scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 
+			check_d_v(d_v, nb_of_formulas, r, "After scatter_2");
+			//print_d_v(d_v, nb_of_formulas, r, "After scatter_2d");
 		}
 
 		gpuErrchk(cudaMemset(d_v, 0, s * sizeof(unsigned int)));
