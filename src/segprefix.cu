@@ -30,13 +30,13 @@ struct clause {
 	 */
 	uint8_t l[3];
 	uint8_t flags;
-//
+	//
 #define c_sat(c) (((c).flags & 0x07u) != 0x00u)
 
-// 
+	// 
 #define c_inv(c) (((c).flags & 0x3fu) == 0x38u)
 
-// there is any reason to substitute any literal to get the formula satisfied
+	// there is any reason to substitute any literal to get the formula satisfied
 #define c_has(c) (!c_sat(c) && !c_inv(c))
 };
 
@@ -496,17 +496,6 @@ __global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 /**************************** UTILS ******************************/
 
-void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n) {
-	for(int i = 0; i < r; ++i) {
-		for(int j = 0; j < 3; ++j) {
-			uint8_t var = formula[i].l[j];
-			bool sign = ((var & 0x80u) >> 7);
-			bool value = (formula[i].flags & (0x01u << j)) >> j;
-			assignments[abs8(var) - 1] = sign ^ value; 
-		}
-	}
-}
-
 void print_formula(clause *formula, int r) {
 	for(int i = 0; i < r; ++i) {
 		uint8_t *ptr = (uint8_t *) &formula[i];
@@ -561,7 +550,6 @@ void print_batch(clause *d_f1, unsigned int *d_v, int nb_of_formulas, int r) {
 	gpuErrchk(cudaDeviceSynchronize());
 
 	std::vector<clause> storage(nb_of_formulas * r);
-	std::vector<unsigned int> validities(nb_of_formulas);
 	gpuErrchk(cudaMemcpy(storage.data(), d_f1, storage.size() * sizeof(clause), cudaMemcpyDefault));
 
 	printf("-------------------------------- BATCH -------------------------------------\n");
@@ -611,21 +599,35 @@ void swap(std::vector<clause> &storage, clause *d_f1, int &nb_of_formulas, int s
 		clause *dst = storage.data() + storage.size() - transfer;
 		clause *src = d_f1 + nb_of_formulas * r - transfer;
 		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
-		nb_of_formulas += difference; // check
+		nb_of_formulas -= difference; // check
 	} else if(surplus < 0) {
-		int difference = std::min(-surplus, storage.size() / r);
+		int difference = std::min(-surplus, (int) storage.size() / r);
 		int transfer = difference * r;
 		clause *dst = d_f1 + nb_of_formulas * r;
 		clause *src = storage.data() + storage.size() - transfer;
 		gpuErrchk(cudaMemcpy(dst, src, transfer * sizeof(clause), cudaMemcpyDefault));
 		storage.resize(storage.size() - transfer);
-		nb_of_formulas -= difference; // check
+		nb_of_formulas += difference; // check
+	}
+}
+
+/************************ EXTRACT_VARS ***************************/
+
+void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n) {
+	for(int i = 0; i < r; ++i) {
+		for(int j = 0; j < 3; ++j) {
+			uint8_t var = formula[i].l[j];
+			int id = abs8(var);
+			bool sign = ((var & 0x80u) >> 7);
+			bool value = (formula[i].flags & (0x01u << j)) >> j;
+			assignments[abs8(var)] = (sign ^ value);
+		}
 	}
 }
 
 /************************** PIPELINE *****************************/
 
-void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
+bool pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
 	int nb_of_formulas = s;
 	clause *d_f1;
 	clause *d_f2;
@@ -639,16 +641,19 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
 
-	while(nb_of_formulas) { // check
+	while(true) { // check
 		std::swap(d_f1, d_f2);
 		// jak ma sie to blokowanie do warunku w while-u?
 		gpuErrchk(cudaDeviceSynchronize());
 
 		if(formula_satisfied != -1) {
-			printf("LEAVING THAT HELL!\n");
+			storage.resize(r);
 			gpuErrchk(cudaMemcpy(storage.data(), d_f1 + formula_satisfied * r, r * sizeof(clause), cudaMemcpyDefault));
 			extract_vars(storage.data(), r, assignments, n);
-			return;
+			gpuErrchk(cudaFree(d_f1));
+			gpuErrchk(cudaFree(d_f2));
+			gpuErrchk(cudaFree(d_v));
+			return true;
 		}
 
 		int range_parts = (nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
@@ -674,6 +679,9 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		gpuErrchk(cudaDeviceSynchronize());
 
 		nb_of_formulas = nb_of_valid;
+		printf("nb_of_formulas: %d\n", nb_of_formulas); //
+		// if nb_of_formulas is 0, then go straight to the swap
+		// no 2d scan is necessary
 
 		printf("Batch after scatter_1d\n");
 		print_batch(d_f2, d_v, nb_of_formulas, r); //
@@ -683,7 +691,6 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		blocks = (r * nb_of_formulas + range - 1) / range;
 
 		printf("SCAN 2D\n"); //
-		printf("nb_of_formulas: %d\n", nb_of_formulas); //
 		printf("range_parts: %d\n", range_parts); //
 		printf("range: %d\n", range); //
 		printf("blocks: %d\n", blocks); //
@@ -716,21 +723,30 @@ void pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		//print_d_v(d_v, nb_of_formulas, r);
 
 		gpuErrchk(cudaDeviceSynchronize());
-		printf("Batch after scatter_2d\n");
-		print_batch(d_f1, d_v, nb_of_formulas, r); //
+		//printf("Batch after scatter_2d\n");
+		//print_batch(d_f1, d_v, nb_of_formulas, r); //
+
+		printf("nb_of_formulas: %d\n", nb_of_formulas);
+		printf("storage.size(): %d\n", storage.size() / r);
 
 		gpuErrchk(cudaMemset(d_v, 0, s * sizeof(unsigned int))); // chyba ok
 		swap(storage, d_f1, nb_of_formulas, s, r);
 
+		printf("nb_of_formulas: %d\n", nb_of_formulas);
+		printf("storage.size(): %d\n", storage.size() / r);
+
 		// moze checkowac nb_of_formulas juz teraz? moze sat_kernel nie bedzie sie mogl odpalic?
+		if(nb_of_formulas == 0) {
+			gpuErrchk(cudaFree(d_f1));
+			gpuErrchk(cudaFree(d_f2));
+			gpuErrchk(cudaFree(d_v));
+			return false;
+		}
 
 		sat_kernel<<<(nb_of_formulas + WARPS_NB - 1) / WARPS_NB, 3 * WARPS_NB * 32>>>(d_f1, d_f2, d_v, nb_of_formulas, r); // CHECK CHECK CHECK
 		nb_of_formulas *= 3;
+		//return false;
 	}
-
-	gpuErrchk(cudaFree(d_f1));
-	gpuErrchk(cudaFree(d_f2));
-	gpuErrchk(cudaFree(d_v));
 }
 
 /**************************** MAIN *******************************/
@@ -749,7 +765,7 @@ int main() {
 	std::vector<clause> formulas(r);
 	formulas.reserve(2 * s * r);
 	std::vector<int> freq(n, 0);
-	std::vector<bool> assignments;
+	std::vector<bool> assignments(n);
 
 	for(int i = 0; i < r; ++i) {
 		int j = 0;
@@ -786,7 +802,15 @@ int main() {
 			return sum1 > sum2;
 			});
 
-	pipeline(formulas, n, r, s, log3r, assignments);
+	if(pipeline(formulas, n, r, s, log3r, assignments)) {
+		printf("satisfied\n");
+
+		for(int i = 0; i < n; ++i) {
+			printf("%d: %s\n", i + 1, assignments[i] ? "true" : "false");
+		}
+	} else {
+		printf("not satisfied\n");
+	}
 }
 
 // TODO: generalize 1024 to blockDim.x
