@@ -11,7 +11,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
-#define BATCH_SIZE 27
+#define BATCH_SIZE 81
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -160,7 +160,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 	int lane_id = threadIdx.x & 31;
 	int formula_id = warp_id / 3;
 	int branch_id = warp_id - 3 * formula_id;
-	unsigned int *valid = d_v + b * branch_id + formula_id;
+	unsigned int *valid = d_v + branch_id * b + formula_id;
 	clause *formula = d_f1 + formula_id * r;
 	clause *destination = d_f2 + (branch_id * b + formula_id) * r;
 	clause fc = formula[0]; // this might be slow, use __shfl_sync()?
@@ -271,7 +271,7 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 		__syncthreads();
 
 		if(warp_id == 0) {
-			partials[lane_id] = warp_scan(partials[lane_id]);
+			partials[lane_id] = abs32(warp_scan(partials[lane_id]));
 		}
 
 		__syncthreads();
@@ -486,10 +486,19 @@ __global__ void scatter_2d(clause *d_f1, clause *d_f2, unsigned int *d_v, int r,
 
 	nb_not_null = __shfl_sync(0xffffffffu, nb_not_null, 0);
 
+	if(b == 36 && warp_id == 26) {
+		printf("blockIdx.x: %d, warp_id: %d, lane_id: %d, shift: %d, nb_not_null: %d\n", blockIdx.x, warp_id, lane_id, shift, nb_not_null);
+	}
+
 	for(int i = threadIdx.x & 31; i < r; i += 32) {
 		unsigned int value = pos[i];
 		bool not_null = value & 0x80000000u;
 		int new_pos = not_null ? abs32(value) - 1 : nb_not_null + i - abs32(value);
+
+		if(b == 36 && warp_id == 26) {
+			printf("clause: %d, i: %d, warp_id: %d, lane_id: %d, value: %d-%d, not_null: %d, new_pos: %d\n", *((int *) &formula[i]), i, warp_id, lane_id, !!(value & 0x80000000u), abs32(value), not_null, new_pos);
+		}
+
 		destination[new_pos] = formula[i];
 	}
 }
@@ -649,6 +658,10 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 	preprocess<<<(nb_of_formulas + 31)/32, 1024>>>(d_f1, d_f2, d_v, r, log3r, nb_of_formulas);
 
+	//gpuErrchk(cudaDeviceSynchronize()); //
+	//printf("Batch after preprocess\n"); //
+	//print_batch(d_f2, d_v, nb_of_formulas, r); //
+
 	while(true) { // check
 		std::swap(d_f1, d_f2);
 		// jak ma sie to blokowanie do warunku w while-u?
@@ -680,9 +693,18 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 		if(blocks > 1) {
 			printf("blocks > 1\n"); //
+			gpuErrchk(cudaDeviceSynchronize());
 			small_scan_1d<<<1, 32>>>();
+			gpuErrchk(cudaDeviceSynchronize());
 			propagate_1d<<<blocks - 1, 1024>>>(d_v, nb_of_formulas, range_parts, range); //check
+			gpuErrchk(cudaDeviceSynchronize());
 		}
+
+
+		gpuErrchk(cudaDeviceSynchronize());
+		printf("Right before scatter_1d\n");
+		print_d_v(d_v, nb_of_formulas, 1);
+		gpuErrchk(cudaDeviceSynchronize());
 
 		scatter_1d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 		gpuErrchk(cudaDeviceSynchronize());
@@ -705,8 +727,9 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 		printf("blocks: %d\n", blocks); //
 		printf("\n"); //
 
-		//printf("Before scan_2d\n");
-		//print_d_v(d_v, nb_of_formulas, r);
+		gpuErrchk(cudaDeviceSynchronize());
+		printf("Before scan_2d\n");
+		print_batch(d_f2, d_v, nb_of_formulas, r); //
 
 		//////// CHECK ARGUMENTS!
 		scan_2d<<<blocks, 1024>>>(d_f2, d_v, r * nb_of_formulas, r, range_parts, range); // check
@@ -727,23 +750,18 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 		scatter_2d<<<(nb_of_formulas + 31) / 32, 1024>>>(d_f1, d_f2, d_v, r, nb_of_formulas);
 
-		//gpuErrchk(cudaDeviceSynchronize());
-		//printf("After scatter_2d\n");
-		//print_d_v(d_v, nb_of_formulas, r);
-
 		gpuErrchk(cudaDeviceSynchronize());
-		//printf("Batch after scatter_2d\n");
-		//print_batch(d_f1, d_v, nb_of_formulas, r); //
+		printf("After scatter_2d\n");
+		print_d_v(d_v, nb_of_formulas, r);
 
-		printf("nb_of_formulas: %d\n", nb_of_formulas);
-		printf("storage.size(): %d\n", storage.size() / r);
+		gpuErrchk(cudaDeviceSynchronize()); //
+		printf("Batch after scatter_2d\n"); //
+		print_batch(d_f1, d_v, nb_of_formulas, r); //
 
 		gpuErrchk(cudaMemset(d_v, 0, s * sizeof(unsigned int))); // chyba ok
 		swap(storage, d_f1, nb_of_formulas, s, r);
 
-		printf("nb_of_formulas: %d\n", nb_of_formulas);
-		printf("storage.size(): %d\n", storage.size() / r);
-
+		printf("nb_of_formulas after swap: %d\n", nb_of_formulas);
 		// moze checkowac nb_of_formulas juz teraz? moze sat_kernel nie bedzie sie mogl odpalic?
 		if(nb_of_formulas == 0) {
 			gpuErrchk(cudaFree(d_f1));
@@ -754,7 +772,14 @@ bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std:
 
 		sat_kernel<<<(nb_of_formulas + WARPS_NB - 1) / WARPS_NB, 3 * WARPS_NB * 32>>>(d_f1, d_f2, d_v, nb_of_formulas, r); // CHECK CHECK CHECK
 		nb_of_formulas *= 3;
-		//return false;
+
+		gpuErrchk(cudaDeviceSynchronize());
+		printf("After sat_kernel\n");
+		print_d_v(d_v, nb_of_formulas, 1);
+
+		gpuErrchk(cudaDeviceSynchronize()); //
+		printf("Batch after sat_kernel\n"); //
+		print_batch(d_f2, d_v, nb_of_formulas, r); //
 	}
 }
 
