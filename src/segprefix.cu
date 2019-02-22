@@ -11,7 +11,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 	}
 }
 
-#define BATCH_SIZE 243
+#define BATCH_SIZE 4096
 #define WARPS_NB 10
 #define abs8(n) ((n) & 0x7fu)
 #define abs32(n) ((n) & 0x7fffffffu)
@@ -276,7 +276,8 @@ __global__ void scan_1d(unsigned int *d_v, int b, int range_parts, int range) {
 
 		__syncthreads();
 
-		d_v[tid] = v + partials[warp_id] + prev;
+		v += partials[warp_id] + prev;
+		d_v[tid] = v;
 
 		__syncthreads();
 
@@ -300,12 +301,12 @@ __global__ void propagate_1d(unsigned int *d_v, int b, int range_parts, int rang
 	int tid = (blockIdx.x + 1) * range + threadIdx.x;
 
 	if(threadIdx.x == 0) {
-		prev = abs32(d_p[blockIdx.x]); // check
+		prev = abs32(d_p[blockIdx.x]);
 	}
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < b; tid += 1024) {
+	for(int i = 0; i < range_parts && tid < b; ++i, tid += 1024) {
 		d_v[tid] += prev;
 	}
 }
@@ -454,7 +455,7 @@ __global__ void propagate_2d(unsigned int *d_v, int b, int r, int range_parts, i
 
 	__syncthreads();
 
-	for(int i = 0; i < range_parts && tid < b && tid - range_start < remainder; tid += 1024) {
+	for(int i = 0; i < range_parts && tid < b && tid - range_start < remainder; ++i, tid += 1024) {
 		d_v[tid] += prev;
 		remainder += rem_inc;
 
