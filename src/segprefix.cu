@@ -625,7 +625,7 @@ void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n)
 			bool assigned = (formula[i].flags & (0x08u << j)) >> (j + 3);
 
 			if(assigned) {
-				assignments[abs8(var)] = (sign ^ value);
+				assignments[id] = (sign ^ value);
 			}
 		}
 	}
@@ -633,7 +633,9 @@ void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n)
 
 /************************** PIPELINE *****************************/
 
-bool pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
+bool pipeline(std::vector<clause> &formula, int n, int r, int s, int log3r, std::vector<bool> &assignments) {
+	std::vector<clause> storage;
+	storage.reserve(3 * s * r);
 	int nb_of_formulas = s;
 	clause *d_f1;
 	clause *d_f2;
@@ -641,7 +643,7 @@ bool pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 	gpuErrchk(cudaMalloc(&d_f1, s * r * sizeof(clause)));
 	gpuErrchk(cudaMalloc(&d_f2, s * r * sizeof(clause)));
 	gpuErrchk(cudaMalloc(&d_v, s * r * sizeof(unsigned int)));
-	gpuErrchk(cudaMemcpy(d_f1, storage.data(), r * sizeof(clause), cudaMemcpyDefault));
+	gpuErrchk(cudaMemcpy(d_f1, formula.data(), r * sizeof(clause), cudaMemcpyDefault));
 	gpuErrchk(cudaMemset(d_v, 0, s * sizeof(unsigned int)));
 	storage.resize(0);
 
@@ -656,6 +658,7 @@ bool pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 			storage.resize(r);
 			gpuErrchk(cudaMemcpy(storage.data(), d_f1 + formula_satisfied * r, r * sizeof(clause), cudaMemcpyDefault));
 			extract_vars(storage.data(), r, assignments, n);
+			print_formula(storage.data(), r);
 			gpuErrchk(cudaFree(d_f1));
 			gpuErrchk(cudaFree(d_f2));
 			gpuErrchk(cudaFree(d_v));
@@ -689,8 +692,8 @@ bool pipeline(std::vector<clause> &storage, int n, int r, int s, int log3r, std:
 		// if nb_of_formulas is 0, then go straight to the swap
 		// no 2d scan is necessary
 
-		printf("Batch after scatter_1d\n");
-		print_batch(d_f2, d_v, nb_of_formulas, r); //
+		//printf("Batch after scatter_1d\n");
+		//print_batch(d_f2, d_v, nb_of_formulas, r); //
 
 		range_parts = (r * nb_of_formulas + 32 * 1024 - 1) / (32 * 1024); // check
 		range = range_parts * 1024;
@@ -768,8 +771,7 @@ int main() {
 		++log3r;
 	}
 
-	std::vector<clause> formulas(r);
-	formulas.reserve(2 * s * r);
+	std::vector<clause> formula(r);
 	std::vector<int> freq(n, 0);
 	std::vector<bool> assignments(n);
 
@@ -785,10 +787,10 @@ int main() {
 			}
 
 			if(var > 0) {
-				formulas[i].l[j] = (int8_t) var;
+				formula[i].l[j] = (int8_t) var;
 				++freq[var];
 			} else {
-				formulas[i].l[j] = (int8_t) -var | 0x80u;
+				formula[i].l[j] = (int8_t) -var | 0x80u;
 				++freq[-var];
 			}
 
@@ -796,19 +798,19 @@ int main() {
 		}
 
 		while(j < 3) {
-			formulas[i].flags |= 0x08u << j;
+			formula[i].flags |= 0x08u << j;
 			++j;
 		}
 	}
 
-	std::sort(formulas.begin(), formulas.begin() + r,
+	std::sort(formula.begin(), formula.begin() + r,
 			[&freq](clause &a, clause &b) -> bool {
 			int sum1 = abs8(a.l[0]) + abs8(a.l[1]) + abs8(a.l[2]);
 			int sum2 = abs8(b.l[0]) + abs8(b.l[1]) + abs8(b.l[2]);
 			return sum1 > sum2;
 			});
 
-	if(pipeline(formulas, n, r, s, log3r, assignments)) {
+	if(pipeline(formula, n, r, s, log3r, assignments)) {
 		printf("satisfied\n");
 
 		for(int i = 0; i < n; ++i) {
