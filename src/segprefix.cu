@@ -183,7 +183,7 @@ __global__ void sat_kernel(clause *d_f1, clause *d_f2, unsigned int *d_v, int b,
 			cl = formula[i];
 		}
 
-		ending = __any_sync(0xffffffffu, i < r ? c_sat(cl) : 1);
+		//ending = __any_sync(0xffffffffu, i < r ? c_sat(cl) : 1);
 
 		if(i < r) {
 			for(int l = 0; l < 3; ++l) {
@@ -519,8 +519,10 @@ void print_formula(clause *formula, int r) {
 				printf("%d", ptr[j]);
 			}
 
-			printf("\t\t");
+			printf("\t");
 		}
+
+		printf("\t");
 
 		for(int j = 0; j < 3; ++j) {
 			uint8_t flag = (ptr[3] & (0x09u << j)) >> j;
@@ -620,7 +622,11 @@ void extract_vars(clause *formula, int r, std::vector<bool> &assignments, int n)
 			int id = abs8(var);
 			bool sign = ((var & 0x80u) >> 7);
 			bool value = (formula[i].flags & (0x01u << j)) >> j;
-			assignments[abs8(var)] = (sign ^ value);
+			bool assigned = (formula[i].flags & (0x08u << j)) >> (j + 3);
+
+			if(assigned) {
+				assignments[abs8(var)] = (sign ^ value);
+			}
 		}
 	}
 }
